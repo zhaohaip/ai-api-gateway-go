@@ -82,19 +82,19 @@ func TestProviderGenerateMapsResponseMetadata(t *testing.T) {
 				},
 			},
 		}, nil
-	}}, ProviderConfig{PublicModel: "default-chat", UpstreamModel: "upstream-secret-name"})
+	}})
 	temperature := float32(0)
 
 	response, err := provider.Generate(context.Background(), domain.ChatRequest{
-		Model:       "default-chat",
+		Model:       "upstream-secret-name",
 		Messages:    []domain.Message{{Role: domain.RoleUser, Content: "hi"}},
 		Temperature: &temperature,
 	})
 	if err != nil {
 		t.Fatalf("Generate() error = %v", err)
 	}
-	if response.Model != "default-chat" {
-		t.Fatalf("response model = %q, want logical model", response.Model)
+	if response.Model != "upstream-secret-name" {
+		t.Fatalf("response model = %q, want upstream model inside adapter", response.Model)
 	}
 	if response.FinishReason == nil || *response.FinishReason != "stop" {
 		t.Fatalf("finish reason = %v", response.FinishReason)
@@ -111,7 +111,7 @@ func TestProviderDoesNotInventMissingMetadata(t *testing.T) {
 		_ ...model.Option,
 	) (*schema.Message, error) {
 		return &schema.Message{Role: schema.Assistant, Content: "hello"}, nil
-	}}, ProviderConfig{PublicModel: "default-chat", UpstreamModel: "upstream"})
+	}})
 
 	response, err := provider.Generate(context.Background(), validDomainRequest())
 	if err != nil {
@@ -122,21 +122,30 @@ func TestProviderDoesNotInventMissingMetadata(t *testing.T) {
 	}
 }
 
-func TestProviderUnknownModel(t *testing.T) {
-	called := false
+func TestProviderUsesRequestUpstreamModelForEachCall(t *testing.T) {
+	calledModels := make([]string, 0, 2)
 	provider := NewProvider(fakeChatModel{generate: func(
 		_ context.Context,
 		_ []*schema.Message,
-		_ ...model.Option,
+		options ...model.Option,
 	) (*schema.Message, error) {
-		called = true
-		return nil, nil
-	}}, ProviderConfig{PublicModel: "default-chat", UpstreamModel: "upstream"})
+		commonOptions := model.GetCommonOptions(nil, options...)
+		if commonOptions.Model == nil {
+			t.Fatal("Generate() did not set model option")
+		}
+		calledModels = append(calledModels, *commonOptions.Model)
+		return &schema.Message{Role: schema.Assistant, Content: "ok"}, nil
+	}})
 
-	_, err := provider.Generate(context.Background(), domain.ChatRequest{Model: "unknown"})
-	assertDomainErrorKind(t, err, domain.ErrorKindModelNotFound)
-	if called {
-		t.Fatal("unknown model called Eino ChatModel")
+	for _, upstreamModel := range []string{"first-upstream", "second-upstream"} {
+		request := validDomainRequest()
+		request.Model = upstreamModel
+		if _, err := provider.Generate(context.Background(), request); err != nil {
+			t.Fatalf("Generate(%q) error = %v", upstreamModel, err)
+		}
+	}
+	if len(calledModels) != 2 || calledModels[0] != "first-upstream" || calledModels[1] != "second-upstream" {
+		t.Fatalf("called models = %#v", calledModels)
 	}
 }
 
@@ -160,7 +169,7 @@ func TestProviderErrorClassification(t *testing.T) {
 				_ ...model.Option,
 			) (*schema.Message, error) {
 				return nil, test.err
-			}}, ProviderConfig{PublicModel: "default-chat", UpstreamModel: "upstream"})
+			}})
 
 			_, err := provider.Generate(context.Background(), validDomainRequest())
 			assertDomainErrorKind(t, err, test.kind)
@@ -183,7 +192,7 @@ func TestProviderPropagatesCancellation(t *testing.T) {
 		}
 		<-ctx.Done()
 		return nil, ctx.Err()
-	}}, ProviderConfig{PublicModel: "default-chat", UpstreamModel: "upstream"})
+	}})
 	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), contextKey, "request-value"))
 	cancel()
 
@@ -193,7 +202,7 @@ func TestProviderPropagatesCancellation(t *testing.T) {
 
 func validDomainRequest() domain.ChatRequest {
 	return domain.ChatRequest{
-		Model:    "default-chat",
+		Model:    "upstream",
 		Messages: []domain.Message{{Role: domain.RoleUser, Content: "hello"}},
 	}
 }

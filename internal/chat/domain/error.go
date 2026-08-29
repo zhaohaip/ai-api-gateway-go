@@ -1,6 +1,12 @@
 package domain
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
+
+// ErrModelNotFound 表示请求的逻辑模型未注册。
+var ErrModelNotFound = errors.New("model not found")
 
 // ErrorKind 是稳定的网关错误分类。
 type ErrorKind string
@@ -55,6 +61,17 @@ func NewError(kind ErrorKind, message, param, code string, cause error) *Error {
 // NewInvalidRequestError 创建参数错误。
 func NewInvalidRequestError(message, param, code string) *Error {
 	return NewError(ErrorKindInvalidRequest, message, param, code, nil)
+}
+
+// NewModelNotFoundError 创建稳定的未知逻辑模型错误。
+func NewModelNotFoundError(model string) *Error {
+	return NewError(
+		ErrorKindModelNotFound,
+		fmt.Sprintf("The model '%s' does not exist.", model),
+		"model",
+		"model_not_found",
+		ErrModelNotFound,
+	)
 }
 
 // NewInternalError 创建不泄露内部细节的网关异常。

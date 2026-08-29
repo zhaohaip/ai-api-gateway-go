@@ -18,30 +18,54 @@ type ChatProvider interface {
 
 // ChatService 组织聊天模型调用。
 type ChatService struct {
-	provider ChatProvider
+	registry ModelRegistry
 }
 
 // NewChatService 创建聊天服务。
-func NewChatService(provider ChatProvider) *ChatService {
-	return &ChatService{provider: provider}
+func NewChatService(registry ModelRegistry) *ChatService {
+	return &ChatService{registry: registry}
 }
 
 // Generate 执行一次非流式生成。
 func (s *ChatService) Generate(ctx context.Context, req domain.ChatRequest) (domain.ChatResponse, error) {
-	response, err := s.provider.Generate(ctx, req)
-	if err == nil {
-		return response, nil
+	route, providerRequest, err := s.resolveRequest(req)
+	if err != nil {
+		return domain.ChatResponse{}, err
 	}
-	return domain.ChatResponse{}, normalizeProviderError(err, "generate chat completion")
+	response, err := route.Provider.Generate(ctx, providerRequest)
+	if err != nil {
+		return domain.ChatResponse{}, normalizeProviderError(err, "generate chat completion")
+	}
+	response.Model = route.ExposedModel
+	return response, nil
 }
 
 // Stream 创建一次流式聊天调用。
 func (s *ChatService) Stream(ctx context.Context, req domain.ChatRequest) (domain.ChatStream, error) {
-	stream, err := s.provider.Stream(ctx, req)
+	route, providerRequest, err := s.resolveRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	stream, err := route.Provider.Stream(ctx, providerRequest)
 	if err != nil {
 		return nil, normalizeProviderError(err, "create chat completion stream")
 	}
 	return &chatStream{stream: stream}, nil
+}
+
+// ListModels 按稳定顺序返回已注册的逻辑模型。
+func (s *ChatService) ListModels() []ModelInfo {
+	return s.registry.List()
+}
+
+func (s *ChatService) resolveRequest(req domain.ChatRequest) (ModelRoute, domain.ChatRequest, error) {
+	route, err := s.registry.Resolve(req.Model)
+	if err != nil {
+		return ModelRoute{}, domain.ChatRequest{}, normalizeProviderError(err, "resolve chat model")
+	}
+	providerRequest := req
+	providerRequest.Model = route.UpstreamModel
+	return route, providerRequest, nil
 }
 
 func normalizeProviderError(err error, operation string) error {

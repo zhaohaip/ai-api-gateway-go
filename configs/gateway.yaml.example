@@ -1,0 +1,27 @@
+address: ":8080"
+
+providers:
+  - name: deepseek
+    type: openai-compatible
+    base_url: https://api.deepseek.com/v1
+    api_key_env: DEEPSEEK_API_KEY
+    timeout: 60s
+
+  - name: qwen
+    type: openai-compatible
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key_env: QWEN_API_KEY
+    timeout: 60s
+
+models:
+  - name: default-chat
+    provider: deepseek
+    upstream_model: deepseek-chat
+
+  - name: reasoning-chat
+    provider: deepseek
+    upstream_model: deepseek-reasoner
+
+  - name: fast-chat
+    provider: qwen
+    upstream_model: qwen-plus

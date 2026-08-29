@@ -62,14 +62,11 @@ func TestProviderWithLocalOpenAICompatibleUpstream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewChatModel() error = %v", err)
 	}
-	provider := NewProvider(chatModel, ProviderConfig{
-		PublicModel:   "default-chat",
-		UpstreamModel: "upstream-secret-name",
-	})
+	provider := NewProvider(chatModel)
 	temperature := float32(0.7)
 	maxCompletionTokens := 1024
 	response, err := provider.Generate(context.Background(), domain.ChatRequest{
-		Model:               "default-chat",
+		Model:               "upstream-secret-name",
 		Messages:            []domain.Message{{Role: domain.RoleUser, Content: "ping"}},
 		Temperature:         &temperature,
 		MaxCompletionTokens: &maxCompletionTokens,
@@ -91,7 +88,7 @@ func TestProviderWithLocalOpenAICompatibleUpstream(t *testing.T) {
 	if len(upstream.Messages) != 1 || upstream.Messages[0].Content != "ping" {
 		t.Errorf("upstream messages = %#v", upstream.Messages)
 	}
-	if response.Model != "default-chat" || response.Message.Content != "pong" {
+	if response.Model != "upstream-secret-name" || response.Message.Content != "pong" {
 		t.Fatalf("response = %#v", response)
 	}
 	if response.Usage == nil || response.Usage.TotalTokens != 18 {
@@ -138,14 +135,11 @@ func TestProviderStreamWithLocalOpenAICompatibleUpstream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewChatModel() error = %v", err)
 	}
-	provider := NewProvider(chatModel, ProviderConfig{
-		PublicModel:   "default-chat",
-		UpstreamModel: "private-model",
-	})
+	provider := NewProvider(chatModel)
 	temperature := float32(0.2)
 	maxCompletionTokens := 64
 	stream, err := provider.Stream(context.Background(), domain.ChatRequest{
-		Model:               "default-chat",
+		Model:               "private-model",
 		Messages:            []domain.Message{{Role: domain.RoleUser, Content: "hello"}},
 		Temperature:         &temperature,
 		MaxCompletionTokens: &maxCompletionTokens,

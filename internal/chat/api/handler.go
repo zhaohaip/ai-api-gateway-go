@@ -62,6 +62,11 @@ func (h *Handler) CreateChatCompletion(c *gin.Context) {
 	h.generateChatCompletion(c, request.Model, domainRequest)
 }
 
+// ListModels 处理 GET /v1/models。
+func (h *Handler) ListModels(c *gin.Context) {
+	c.JSON(http.StatusOK, toOpenAIModelList(h.chatService.ListModels(), h.now().Unix()))
+}
+
 func (h *Handler) generateChatCompletion(c *gin.Context, requestedModel string, request domain.ChatRequest) {
 	response, err := h.chatService.Generate(c.Request.Context(), request)
 	if err != nil {

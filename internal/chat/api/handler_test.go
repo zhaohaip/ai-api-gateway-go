@@ -35,7 +35,7 @@ func TestHandlerValidRequestAndOpenAIResponse(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	provider := handlerFakeProvider{
 		generate: func(_ context.Context, request domain.ChatRequest) (domain.ChatResponse, error) {
-			if request.Model != "default-chat" || len(request.Messages) != 1 {
+			if request.Model != "private-upstream-model" || len(request.Messages) != 1 {
 				t.Fatalf("service request = %#v", request)
 			}
 			if request.Temperature == nil || *request.Temperature != 0.7 {
@@ -61,7 +61,18 @@ func TestHandlerValidRequestAndOpenAIResponse(t *testing.T) {
 			return nil, nil
 		},
 	}
-	handler := NewHandler(service.NewChatService(provider))
+	registry, err := service.NewModelRegistry([]service.ModelRoute{
+		{
+			ExposedModel:  "default-chat",
+			UpstreamModel: "private-upstream-model",
+			ProviderName:  "test-provider",
+			Provider:      provider,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewModelRegistry() error = %v", err)
+	}
+	handler := NewHandler(service.NewChatService(registry))
 	handler.newID = func() (string, error) { return "chatcmpl-test", nil }
 	handler.now = func() time.Time { return time.Unix(1787880000, 0) }
 
@@ -117,7 +128,7 @@ func TestHandlerRequestValidation(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			called := false
-			handler := NewHandler(service.NewChatService(handlerFakeProvider{generate: func(
+			handler := NewHandler(newTestChatService(t, handlerFakeProvider{generate: func(
 				_ context.Context,
 				_ domain.ChatRequest,
 			) (domain.ChatResponse, error) {
@@ -159,7 +170,7 @@ func TestHandlerDomainErrorMapping(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			handler := NewHandler(service.NewChatService(handlerFakeProvider{generate: func(
+			handler := NewHandler(newTestChatService(t, handlerFakeProvider{generate: func(
 				_ context.Context,
 				_ domain.ChatRequest,
 			) (domain.ChatResponse, error) {
@@ -179,7 +190,7 @@ func TestHandlerDomainErrorMapping(t *testing.T) {
 
 func TestHandlerPropagatesClientCancellation(t *testing.T) {
 	contextObserved := false
-	handler := NewHandler(service.NewChatService(handlerFakeProvider{generate: func(
+	handler := NewHandler(newTestChatService(t, handlerFakeProvider{generate: func(
 		ctx context.Context,
 		_ domain.ChatRequest,
 	) (domain.ChatResponse, error) {
@@ -204,7 +215,7 @@ func TestHandlerPropagatesClientCancellation(t *testing.T) {
 }
 
 func TestHandlerOmitsUnknownUsageAndReturnsNullFinishReason(t *testing.T) {
-	handler := NewHandler(service.NewChatService(handlerFakeProvider{generate: func(
+	handler := NewHandler(newTestChatService(t, handlerFakeProvider{generate: func(
 		_ context.Context,
 		request domain.ChatRequest,
 	) (domain.ChatResponse, error) {
@@ -230,7 +241,7 @@ func TestCompletionIDsAreUnique(t *testing.T) {
 	provider := handlerFakeProvider{generate: func(_ context.Context, request domain.ChatRequest) (domain.ChatResponse, error) {
 		return domain.ChatResponse{Model: request.Model, Message: domain.Message{Role: domain.RoleAssistant, Content: "hello"}}, nil
 	}}
-	handler := NewHandler(service.NewChatService(provider))
+	handler := NewHandler(newTestChatService(t, provider))
 	router := NewRouter(handler)
 	first := performRequest(router, context.Background(), validRequestJSON(), "application/json")
 	second := performRequest(router, context.Background(), validRequestJSON(), "application/json")
@@ -244,6 +255,100 @@ func TestCompletionIDsAreUnique(t *testing.T) {
 	if firstResponse.ID == secondResponse.ID || !strings.HasPrefix(firstResponse.ID, "chatcmpl-") {
 		t.Fatalf("completion IDs are not unique OpenAI-style IDs: %q, %q", firstResponse.ID, secondResponse.ID)
 	}
+}
+
+func TestHandlerUnknownModelReturnsOpenAIModelNotFound(t *testing.T) {
+	providerCalled := false
+	handler := NewHandler(newTestChatService(t, handlerFakeProvider{generate: func(
+		_ context.Context,
+		_ domain.ChatRequest,
+	) (domain.ChatResponse, error) {
+		providerCalled = true
+		return domain.ChatResponse{}, nil
+	}}))
+
+	recorder := performRequest(
+		NewRouter(handler),
+		context.Background(),
+		`{"model":"unknown-model","messages":[{"role":"user","content":"hello"}]}`,
+		"application/json",
+	)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	response := decodeErrorResponse(t, recorder)
+	if response.Error.Message != "The model 'unknown-model' does not exist." ||
+		response.Error.Type != "invalid_request_error" || response.Error.Code != "model_not_found" ||
+		response.Error.Param == nil || *response.Error.Param != "model" {
+		t.Fatalf("error = %#v", response.Error)
+	}
+	if providerCalled {
+		t.Fatal("unknown model called a provider")
+	}
+}
+
+func TestHandlerListsOnlyLogicalModelsInRegistrationOrder(t *testing.T) {
+	provider := handlerFakeProvider{}
+	registry, err := service.NewModelRegistry([]service.ModelRoute{
+		{
+			ExposedModel:  "default-chat",
+			UpstreamModel: "private-deepseek-model",
+			ProviderName:  "secret-deepseek-provider",
+			Provider:      provider,
+		},
+		{
+			ExposedModel:  "fast-chat",
+			UpstreamModel: "private-qwen-model",
+			ProviderName:  "secret-qwen-provider",
+			Provider:      provider,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewModelRegistry() error = %v", err)
+	}
+	handler := NewHandler(service.NewChatService(registry))
+	handler.now = func() time.Time { return time.Unix(1787912515, 0) }
+	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	recorder := httptest.NewRecorder()
+
+	NewRouter(handler).ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var response openaiapi.ModelListResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode model list: %v", err)
+	}
+	if response.Object != "list" || len(response.Data) != 2 {
+		t.Fatalf("response = %#v", response)
+	}
+	wantModels := []string{"default-chat", "fast-chat"}
+	for index, want := range wantModels {
+		model := response.Data[index]
+		if model.ID != want || model.Object != "model" || model.Created != 1787912515 || model.OwnedBy != "gateway" {
+			t.Fatalf("model %d = %#v", index, model)
+		}
+	}
+	if strings.Contains(recorder.Body.String(), "private-") || strings.Contains(recorder.Body.String(), "secret-") {
+		t.Fatalf("model list leaked routing details: %s", recorder.Body.String())
+	}
+}
+
+func newTestChatService(t testing.TB, provider service.ChatProvider) *service.ChatService {
+	t.Helper()
+	registry, err := service.NewModelRegistry([]service.ModelRoute{
+		{
+			ExposedModel:  "default-chat",
+			UpstreamModel: "default-chat",
+			ProviderName:  "test",
+			Provider:      provider,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewModelRegistry() error = %v", err)
+	}
+	return service.NewChatService(registry)
 }
 
 func performRequest(handler http.Handler, ctx context.Context, body, contentType string) *httptest.ResponseRecorder {

@@ -23,31 +23,92 @@ type App struct {
 	server *http.Server
 }
 
-// New 在启动阶段初始化并复用 Eino ChatModel。
-func New(ctx context.Context, config config.Config) (*App, error) {
-	chatModel, err := einopenai.NewChatModel(ctx, &einopenai.ChatModelConfig{
-		BaseURL: config.Upstream.BaseURL,
-		APIKey:  config.Upstream.APIKey,
-		Model:   config.Upstream.Model,
-		Timeout: config.Upstream.Timeout,
-	})
+type providerFactory func(context.Context, config.ProviderConfig, string) (service.ChatProvider, error)
+
+// New 在启动阶段初始化并复用各 Provider 的 Eino ChatModel。
+func New(ctx context.Context, appConfig config.Config) (*App, error) {
+	return newApp(ctx, appConfig, newEinoProvider)
+}
+
+func newApp(ctx context.Context, appConfig config.Config, factory providerFactory) (*App, error) {
+	registry, err := buildModelRegistry(ctx, appConfig, factory)
 	if err != nil {
-		return nil, fmt.Errorf("initialize Eino OpenAI ChatModel: %w", err)
+		return nil, err
 	}
-	provider := chateino.NewProvider(chatModel, chateino.ProviderConfig{
-		PublicModel:   config.Upstream.PublicModel,
-		UpstreamModel: config.Upstream.Model,
-	})
-	chatService := service.NewChatService(provider)
+	chatService := service.NewChatService(registry)
 	handler := chatapi.NewHandler(chatService)
 
 	return &App{
 		server: &http.Server{
-			Addr:              config.Address,
+			Addr:              appConfig.Address,
 			Handler:           chatapi.NewRouter(handler),
 			ReadHeaderTimeout: 5 * time.Second,
 		},
 	}, nil
+}
+
+func newEinoProvider(
+	ctx context.Context,
+	providerConfig config.ProviderConfig,
+	defaultModel string,
+) (service.ChatProvider, error) {
+	if providerConfig.Type != config.ProviderTypeOpenAICompatible {
+		return nil, fmt.Errorf("provider %q has unsupported type %q", providerConfig.Name, providerConfig.Type)
+	}
+	chatModel, err := einopenai.NewChatModel(ctx, &einopenai.ChatModelConfig{
+		BaseURL: providerConfig.BaseURL,
+		APIKey:  providerConfig.APIKey,
+		Model:   defaultModel,
+		Timeout: providerConfig.Timeout,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("initialize Eino OpenAI ChatModel: %w", err)
+	}
+	return chateino.NewProvider(chatModel), nil
+}
+
+func buildModelRegistry(
+	ctx context.Context,
+	appConfig config.Config,
+	factory providerFactory,
+) (*service.Registry, error) {
+	defaultModels := make(map[string]string, len(appConfig.Providers))
+	for _, modelConfig := range appConfig.Models {
+		if _, exists := defaultModels[modelConfig.Provider]; !exists {
+			defaultModels[modelConfig.Provider] = modelConfig.UpstreamModel
+		}
+	}
+
+	providers := make(map[string]service.ChatProvider, len(appConfig.Providers))
+	for _, providerConfig := range appConfig.Providers {
+		if _, exists := providers[providerConfig.Name]; exists {
+			return nil, fmt.Errorf("provider name %q is duplicated", providerConfig.Name)
+		}
+		provider, err := factory(ctx, providerConfig, defaultModels[providerConfig.Name])
+		if err != nil {
+			return nil, fmt.Errorf("initialize provider %q: %w", providerConfig.Name, err)
+		}
+		providers[providerConfig.Name] = provider
+	}
+
+	routes := make([]service.ModelRoute, 0, len(appConfig.Models))
+	for _, modelConfig := range appConfig.Models {
+		provider, exists := providers[modelConfig.Provider]
+		if !exists {
+			return nil, fmt.Errorf("model %q references unknown provider %q", modelConfig.Name, modelConfig.Provider)
+		}
+		routes = append(routes, service.ModelRoute{
+			ExposedModel:  modelConfig.Name,
+			UpstreamModel: modelConfig.UpstreamModel,
+			ProviderName:  modelConfig.Provider,
+			Provider:      provider,
+		})
+	}
+	registry, err := service.NewModelRegistry(routes)
+	if err != nil {
+		return nil, fmt.Errorf("initialize model registry: %w", err)
+	}
+	return registry, nil
 }
 
 // Run 启动 HTTP Server，并在 Context 取消时优雅关闭。

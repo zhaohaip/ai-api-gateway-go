@@ -47,11 +47,11 @@ func TestProviderStreamMapsRequestAndChunks(t *testing.T) {
 				},
 			},
 		}), nil
-	}}, ProviderConfig{PublicModel: "default-chat", UpstreamModel: "upstream-secret-name"})
+	}})
 	ctx := context.WithValue(context.Background(), streamContextKey{}, "request-value")
 
 	stream, err := provider.Stream(ctx, domain.ChatRequest{
-		Model:       "default-chat",
+		Model:       "upstream-secret-name",
 		Messages:    []domain.Message{{Role: domain.RoleUser, Content: "hello"}},
 		Temperature: &temperature,
 	})
@@ -84,24 +84,6 @@ func TestProviderStreamMapsRequestAndChunks(t *testing.T) {
 	}
 	if _, err := stream.Recv(); !errors.Is(err, io.EOF) {
 		t.Fatalf("last Recv() error = %v, want io.EOF", err)
-	}
-}
-
-func TestProviderStreamUnknownModel(t *testing.T) {
-	called := false
-	provider := NewProvider(fakeChatModel{stream: func(
-		_ context.Context,
-		_ []*schema.Message,
-		_ ...model.Option,
-	) (*schema.StreamReader[*schema.Message], error) {
-		called = true
-		return nil, nil
-	}}, ProviderConfig{PublicModel: "default-chat", UpstreamModel: "upstream"})
-
-	_, err := provider.Stream(context.Background(), domain.ChatRequest{Model: "unknown"})
-	assertDomainErrorKind(t, err, domain.ErrorKindModelNotFound)
-	if called {
-		t.Fatal("unknown model called Eino ChatModel.Stream")
 	}
 }
 

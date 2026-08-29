@@ -79,13 +79,25 @@ func TestHandlerStreamsOpenAICompatibleSSE(t *testing.T) {
 			return domain.ChatResponse{}, nil
 		},
 		stream: func(_ context.Context, request domain.ChatRequest) (domain.ChatStream, error) {
-			if request.Model != "default-chat" || len(request.Messages) != 1 {
+			if request.Model != "private-stream-model" || len(request.Messages) != 1 {
 				t.Fatalf("stream request = %#v", request)
 			}
 			return stream, nil
 		},
 	}
-	handler := newQuietHandler(provider)
+	registry, err := service.NewModelRegistry([]service.ModelRoute{
+		{
+			ExposedModel:  "default-chat",
+			UpstreamModel: "private-stream-model",
+			ProviderName:  "stream-provider",
+			Provider:      provider,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewModelRegistry() error = %v", err)
+	}
+	handler := NewHandler(service.NewChatService(registry))
+	handler.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	handler.newID = func() (string, error) { return "chatcmpl-stream-test", nil }
 	handler.now = func() time.Time { return time.Unix(1787880000, 0) }
 	recorder := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
@@ -168,7 +180,7 @@ func TestHandlerFiltersMeaninglessChunksAndMapsReasoning(t *testing.T) {
 		}}},
 		{chunk: domain.ChatChunk{FinishReason: &finishReason}},
 	}}
-	handler := newQuietHandler(handlerFakeProvider{
+	handler := newQuietHandler(t, handlerFakeProvider{
 		stream: func(_ context.Context, _ domain.ChatRequest) (domain.ChatStream, error) {
 			return stream, nil
 		},
@@ -247,7 +259,7 @@ func TestHandlerStreamFailureBeforeFirstChunkReturnsJSONError(t *testing.T) {
 		"upstream_rate_limited",
 		nil,
 	)}}}
-	handler := newQuietHandler(handlerFakeProvider{
+	handler := newQuietHandler(t, handlerFakeProvider{
 		stream: func(_ context.Context, _ domain.ChatRequest) (domain.ChatStream, error) {
 			return stream, nil
 		},
@@ -274,7 +286,7 @@ func TestHandlerPartialStreamFailureStopsWithoutJSONOrDone(t *testing.T) {
 		{chunk: contentChunk("partial")},
 		{err: domain.NewError(domain.ErrorKindUpstream, "upstream failed", "", "upstream_error", nil)},
 	}}
-	handler := newQuietHandler(handlerFakeProvider{
+	handler := newQuietHandler(t, handlerFakeProvider{
 		stream: func(_ context.Context, _ domain.ChatRequest) (domain.ChatStream, error) {
 			return stream, nil
 		},
@@ -307,7 +319,7 @@ func TestHandlerStreamCancellationPropagatesAndCloses(t *testing.T) {
 		<-providerContext.Done()
 		return domain.ChatChunk{}, providerContext.Err()
 	}
-	handler := newQuietHandler(handlerFakeProvider{
+	handler := newQuietHandler(t, handlerFakeProvider{
 		stream: func(receivedContext context.Context, _ domain.ChatRequest) (domain.ChatStream, error) {
 			providerContext = receivedContext
 			if receivedContext.Value(streamRequestContextKey{}) != "value" {
@@ -331,7 +343,7 @@ func TestHandlerStreamCancellationPropagatesAndCloses(t *testing.T) {
 
 func TestHandlerEmptyStreamReturnsJSONErrorAndCloses(t *testing.T) {
 	stream := &handlerFakeStream{}
-	handler := newQuietHandler(handlerFakeProvider{
+	handler := newQuietHandler(t, handlerFakeProvider{
 		stream: func(_ context.Context, _ domain.ChatRequest) (domain.ChatStream, error) {
 			return stream, nil
 		},
@@ -353,7 +365,7 @@ func TestHandlerEmptyStreamReturnsJSONErrorAndCloses(t *testing.T) {
 }
 
 func TestHandlerStreamCreationFailureReturnsJSONError(t *testing.T) {
-	handler := newQuietHandler(handlerFakeProvider{
+	handler := newQuietHandler(t, handlerFakeProvider{
 		stream: func(_ context.Context, _ domain.ChatRequest) (domain.ChatStream, error) {
 			return nil, domain.NewError(domain.ErrorKindTimeout, "timed out", "", "upstream_timeout", nil)
 		},
@@ -370,7 +382,7 @@ func TestHandlerStreamCreationFailureReturnsJSONError(t *testing.T) {
 
 func TestHandlerRejectsWriterWithoutFlush(t *testing.T) {
 	streamCalled := false
-	handler := newQuietHandler(handlerFakeProvider{
+	handler := newQuietHandler(t, handlerFakeProvider{
 		stream: func(_ context.Context, _ domain.ChatRequest) (domain.ChatStream, error) {
 			streamCalled = true
 			return &handlerFakeStream{}, nil
@@ -389,7 +401,7 @@ func TestHandlerRejectsWriterWithoutFlush(t *testing.T) {
 
 func TestHandlerStreamWithoutFinishReasonDoesNotSendDone(t *testing.T) {
 	stream := &handlerFakeStream{results: []streamResult{{chunk: contentChunk("partial")}}}
-	handler := newQuietHandler(handlerFakeProvider{
+	handler := newQuietHandler(t, handlerFakeProvider{
 		stream: func(_ context.Context, _ domain.ChatRequest) (domain.ChatStream, error) {
 			return stream, nil
 		},
@@ -433,8 +445,9 @@ func (w *basicResponseWriter) Write(data []byte) (int, error) {
 	return w.body.Write(data)
 }
 
-func newQuietHandler(provider service.ChatProvider) *Handler {
-	handler := NewHandler(service.NewChatService(provider))
+func newQuietHandler(t *testing.T, provider service.ChatProvider) *Handler {
+	t.Helper()
+	handler := NewHandler(newTestChatService(t, provider))
 	handler.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	return handler
 }

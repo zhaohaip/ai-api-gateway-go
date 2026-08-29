@@ -3,6 +3,7 @@ package api
 import (
 	openaiapi "github.com/zhaohaip/ai-api-gateway-go/api/openai"
 	"github.com/zhaohaip/ai-api-gateway-go/internal/chat/domain"
+	"github.com/zhaohaip/ai-api-gateway-go/internal/chat/service"
 )
 
 func toDomainRequest(request openaiapi.ChatCompletionRequest) domain.ChatRequest {
@@ -91,4 +92,20 @@ func toOpenAIChunk(
 func hasOpenAIChunkData(chunk domain.ChatChunk, includeAssistantRole bool) bool {
 	return includeAssistantRole || chunk.Delta.Content != nil || chunk.Delta.ReasoningContent != nil ||
 		chunk.FinishReason != nil || chunk.Usage != nil
+}
+
+func toOpenAIModelList(models []service.ModelInfo, created int64) openaiapi.ModelListResponse {
+	result := openaiapi.ModelListResponse{
+		Object: "list",
+		Data:   make([]openaiapi.Model, 0, len(models)),
+	}
+	for _, model := range models {
+		result.Data = append(result.Data, openaiapi.Model{
+			ID:      model.ID,
+			Object:  "model",
+			Created: created,
+			OwnedBy: "gateway",
+		})
+	}
+	return result
 }

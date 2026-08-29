@@ -6,6 +6,7 @@ require (
 	github.com/cloudwego/eino v0.9.16
 	github.com/cloudwego/eino-ext/components/model/openai v0.1.13
 	github.com/gin-gonic/gin v1.12.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
@@ -55,5 +56,4 @@ require (
 	golang.org/x/sys v0.41.0 // indirect
 	golang.org/x/text v0.34.0 // indirect
 	google.golang.org/protobuf v1.36.10 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
