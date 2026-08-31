@@ -1,5 +1,20 @@
 address: ":8080"
 
+auth:
+  api_keys:
+    - id: demo-client
+      key_env: GATEWAY_DEMO_API_KEY
+      enabled: true
+      allowed_models:
+        - default-chat
+        - fast-chat
+
+    - id: internal-client
+      key_env: GATEWAY_INTERNAL_API_KEY
+      enabled: true
+      allowed_models:
+        - "*"
+
 providers:
   - name: deepseek
     type: openai-compatible

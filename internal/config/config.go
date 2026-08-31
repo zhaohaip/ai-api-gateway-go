@@ -3,6 +3,7 @@ package config
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/zhaohaip/ai-api-gateway-go/internal/auth"
 )
 
 const (
@@ -23,8 +26,14 @@ const (
 // Config 表示应用启动所需的全部配置。
 type Config struct {
 	Address   string
+	Auth      AuthConfig
 	Providers []ProviderConfig
 	Models    []ModelConfig
+}
+
+// AuthConfig 表示客户端访问网关所需的认证配置。
+type AuthConfig struct {
+	APIKeys []auth.APIKey
 }
 
 // ProviderConfig 表示一个上游服务连接配置。
@@ -46,8 +55,20 @@ type ModelConfig struct {
 
 type fileConfig struct {
 	Address   string               `yaml:"address"`
+	Auth      fileAuthConfig       `yaml:"auth"`
 	Providers []fileProviderConfig `yaml:"providers"`
 	Models    []ModelConfig        `yaml:"models"`
+}
+
+type fileAuthConfig struct {
+	APIKeys []fileAPIKeyConfig `yaml:"api_keys"`
+}
+
+type fileAPIKeyConfig struct {
+	ID            string   `yaml:"id"`
+	KeyEnv        string   `yaml:"key_env"`
+	Enabled       bool     `yaml:"enabled"`
+	AllowedModels []string `yaml:"allowed_models"`
 }
 
 type fileProviderConfig struct {
@@ -137,7 +158,75 @@ func parse(contents []byte, lookupEnv func(string) (string, bool)) (Config, erro
 	if len(config.Models) == 0 {
 		return Config{}, fmt.Errorf("at least one model is required")
 	}
+	apiKeys, err := validateClientAPIKeys(loaded.Auth.APIKeys, modelNames, lookupEnv)
+	if err != nil {
+		return Config{}, err
+	}
+	config.Auth.APIKeys = apiKeys
 	return config, nil
+}
+
+func validateClientAPIKeys(
+	apiKeys []fileAPIKeyConfig,
+	modelNames map[string]struct{},
+	lookupEnv func(string) (string, bool),
+) ([]auth.APIKey, error) {
+	if len(apiKeys) == 0 {
+		return nil, fmt.Errorf("at least one client API key is required")
+	}
+	result := make([]auth.APIKey, 0, len(apiKeys))
+	keyIDs := make(map[string]struct{}, len(apiKeys))
+	keyHashes := make(map[[sha256.Size]byte]struct{}, len(apiKeys))
+	for index, apiKey := range apiKeys {
+		apiKey.ID = strings.TrimSpace(apiKey.ID)
+		apiKey.KeyEnv = strings.TrimSpace(apiKey.KeyEnv)
+		if apiKey.ID == "" {
+			return nil, fmt.Errorf("auth.api_keys[%d].id is required", index)
+		}
+		if _, exists := keyIDs[apiKey.ID]; exists {
+			return nil, fmt.Errorf("client API key ID %q is duplicated", apiKey.ID)
+		}
+		if apiKey.KeyEnv == "" {
+			return nil, fmt.Errorf("client API key %q key_env is required", apiKey.ID)
+		}
+		rawKey, exists := lookupEnv(apiKey.KeyEnv)
+		rawKey = strings.TrimSpace(rawKey)
+		if !exists || rawKey == "" {
+			return nil, fmt.Errorf(
+				"client API key %q environment variable %s is required",
+				apiKey.ID,
+				apiKey.KeyEnv,
+			)
+		}
+		keyHash := sha256.Sum256([]byte(rawKey))
+		if _, exists := keyHashes[keyHash]; exists {
+			return nil, fmt.Errorf("client API key value is duplicated")
+		}
+		allowedModels := make([]string, 0, len(apiKey.AllowedModels))
+		for modelIndex, allowedModel := range apiKey.AllowedModels {
+			allowedModel = strings.TrimSpace(allowedModel)
+			if allowedModel != "*" {
+				if _, exists := modelNames[allowedModel]; !exists {
+					return nil, fmt.Errorf(
+						"auth.api_keys[%d].allowed_models[%d] references unknown model %q",
+						index,
+						modelIndex,
+						allowedModel,
+					)
+				}
+			}
+			allowedModels = append(allowedModels, allowedModel)
+		}
+		keyIDs[apiKey.ID] = struct{}{}
+		keyHashes[keyHash] = struct{}{}
+		result = append(result, auth.APIKey{
+			ID:            apiKey.ID,
+			KeyHash:       keyHash,
+			Enabled:       apiKey.Enabled,
+			AllowedModels: allowedModels,
+		})
+	}
+	return result, nil
 }
 
 func validateProvider(

@@ -5,12 +5,32 @@ import (
 	"net/http"
 
 	openaiapi "github.com/zhaohaip/ai-api-gateway-go/api/openai"
+	gatewayauth "github.com/zhaohaip/ai-api-gateway-go/internal/auth"
 	"github.com/zhaohaip/ai-api-gateway-go/internal/chat/domain"
 )
 
 const statusClientClosedRequest = 499
 
 func toHTTPError(err error) (int, openaiapi.ErrorResponse) {
+	var authErr *gatewayauth.Error
+	if errors.As(err, &authErr) {
+		if authErr.Kind == gatewayauth.ErrorKindPermission {
+			param := "model"
+			return http.StatusForbidden, openaiapi.ErrorResponse{Error: openaiapi.ErrorDetail{
+				Message: "You do not have access to this model.",
+				Type:    "permission_error",
+				Param:   &param,
+				Code:    "model_access_denied",
+			}}
+		}
+		return http.StatusUnauthorized, openaiapi.ErrorResponse{Error: openaiapi.ErrorDetail{
+			Message: "Invalid API key.",
+			Type:    "authentication_error",
+			Param:   nil,
+			Code:    "invalid_api_key",
+		}}
+	}
+
 	domainErr := domain.NewInternalError(err)
 	var classifiedErr *domain.Error
 	if errors.As(err, &classifiedErr) {

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/sha256"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,16 @@ import (
 
 const validConfigYAML = `
 address: 127.0.0.1:9090
+auth:
+  api_keys:
+    - id: demo-client
+      key_env: GATEWAY_DEMO_API_KEY
+      enabled: true
+      allowed_models: [default-chat, fast-chat]
+    - id: internal-client
+      key_env: GATEWAY_INTERNAL_API_KEY
+      enabled: true
+      allowed_models: ["*"]
 providers:
   - name: deepseek
     type: openai-compatible
@@ -41,6 +52,8 @@ func TestLoadMultipleProvidersAndModels(t *testing.T) {
 	t.Setenv(configFileEnvironment, path)
 	t.Setenv("DEEPSEEK_API_KEY", "deepseek-secret")
 	t.Setenv("QWEN_API_KEY", "qwen-secret")
+	t.Setenv("GATEWAY_DEMO_API_KEY", "sk-gw-demo")
+	t.Setenv("GATEWAY_INTERNAL_API_KEY", "sk-gw-internal")
 
 	config, err := Load()
 	if err != nil {
@@ -54,6 +67,100 @@ func TestLoadMultipleProvidersAndModels(t *testing.T) {
 	}
 	if config.Models[0].Name != "default-chat" || config.Models[1].Provider != "deepseek" {
 		t.Fatalf("models = %#v", config.Models)
+	}
+	if len(config.Auth.APIKeys) != 2 || config.Auth.APIKeys[0].KeyHash != sha256.Sum256([]byte("sk-gw-demo")) {
+		t.Fatalf("client API keys = %#v", config.Auth.APIKeys)
+	}
+}
+
+func TestParseRejectsInvalidClientAPIKeyConfiguration(t *testing.T) {
+	baseConfig := singleProviderYAML() + validSingleModelYAML()
+	tests := []struct {
+		name    string
+		auth    string
+		keys    map[string]string
+		wantErr string
+	}{
+		{
+			name:    "no client keys",
+			wantErr: "at least one client API key",
+		},
+		{
+			name: "duplicate key ID",
+			auth: `auth:
+  api_keys:
+    - {id: same, key_env: CLIENT_ONE, enabled: true, allowed_models: [chat]}
+    - {id: same, key_env: CLIENT_TWO, enabled: true, allowed_models: [chat]}
+`,
+			keys:    map[string]string{"KEY": "provider", "CLIENT_ONE": "first", "CLIENT_TWO": "second"},
+			wantErr: "client API key ID \"same\" is duplicated",
+		},
+		{
+			name: "duplicate key value",
+			auth: `auth:
+  api_keys:
+    - {id: first, key_env: CLIENT_ONE, enabled: true, allowed_models: [chat]}
+    - {id: second, key_env: CLIENT_TWO, enabled: true, allowed_models: [chat]}
+`,
+			keys:    map[string]string{"KEY": "provider", "CLIENT_ONE": "same", "CLIENT_TWO": "same"},
+			wantErr: "client API key value is duplicated",
+		},
+		{
+			name: "missing key environment variable",
+			auth: `auth:
+  api_keys:
+    - {id: client, key_env: MISSING_CLIENT_KEY, enabled: true, allowed_models: [chat]}
+`,
+			keys:    map[string]string{"KEY": "provider"},
+			wantErr: "environment variable MISSING_CLIENT_KEY is required",
+		},
+		{
+			name: "disabled key still requires environment variable",
+			auth: `auth:
+  api_keys:
+    - {id: disabled, key_env: MISSING_DISABLED_KEY, enabled: false, allowed_models: [chat]}
+`,
+			keys:    map[string]string{"KEY": "provider"},
+			wantErr: "environment variable MISSING_DISABLED_KEY is required",
+		},
+		{
+			name: "unknown allowed model",
+			auth: `auth:
+  api_keys:
+    - {id: client, key_env: CLIENT_KEY, enabled: true, allowed_models: [unknown]}
+`,
+			keys:    map[string]string{"KEY": "provider", "CLIENT_KEY": "client"},
+			wantErr: "references unknown model \"unknown\"",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			keys := test.keys
+			if keys == nil {
+				keys = map[string]string{"KEY": "provider"}
+			}
+			_, err := parse([]byte(test.auth+baseConfig), mapLookup(keys))
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("parse() error = %v, want containing %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestParseAcceptsWildcardModelPermission(t *testing.T) {
+	contents := `auth:
+  api_keys:
+    - {id: client, key_env: CLIENT_KEY, enabled: true, allowed_models: ["*"]}
+` + singleProviderYAML() + validSingleModelYAML()
+	config, err := parse([]byte(contents), mapLookup(map[string]string{
+		"KEY":        "provider",
+		"CLIENT_KEY": "client",
+	}))
+	if err != nil {
+		t.Fatalf("parse() error = %v", err)
+	}
+	if len(config.Auth.APIKeys) != 1 || config.Auth.APIKeys[0].AllowedModels[0] != "*" {
+		t.Fatalf("auth config = %#v", config.Auth)
 	}
 }
 

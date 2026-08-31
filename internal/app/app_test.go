@@ -2,10 +2,17 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	openaiapi "github.com/zhaohaip/ai-api-gateway-go/api/openai"
+	gatewayauth "github.com/zhaohaip/ai-api-gateway-go/internal/auth"
 	"github.com/zhaohaip/ai-api-gateway-go/internal/chat/domain"
 	"github.com/zhaohaip/ai-api-gateway-go/internal/chat/service"
 	"github.com/zhaohaip/ai-api-gateway-go/internal/config"
@@ -100,5 +107,96 @@ func TestBuildModelRegistryFailsWhenProviderInitializationFails(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "provider") {
 		t.Fatalf("buildModelRegistry() error = %v", err)
+	}
+}
+
+func TestAppUsesProviderAPIKeyInsteadOfGatewayAPIKeyUpstream(t *testing.T) {
+	const (
+		gatewayAPIKey  = "sk-gw-client-only"
+		providerAPIKey = "provider-upstream-only"
+	)
+	type upstreamRequest struct {
+		Authorization string
+		Model         string
+	}
+	upstreamRequests := make(chan upstreamRequest, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		var body struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Errorf("decode upstream request: %v", err)
+		}
+		upstreamRequests <- upstreamRequest{
+			Authorization: request.Header.Get("Authorization"),
+			Model:         body.Model,
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		if _, err := writer.Write([]byte(`{
+            "id":"upstream-id",
+            "object":"chat.completion",
+            "created":1,
+            "model":"private-upstream",
+            "choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]
+        }`)); err != nil {
+			t.Errorf("write upstream response: %v", err)
+		}
+	}))
+	defer upstream.Close()
+
+	application, err := New(context.Background(), config.Config{
+		Address: ":0",
+		Auth: config.AuthConfig{APIKeys: []gatewayauth.APIKey{
+			{
+				ID:            "client",
+				KeyHash:       sha256.Sum256([]byte(gatewayAPIKey)),
+				Enabled:       true,
+				AllowedModels: []string{"default-chat"},
+			},
+		}},
+		Providers: []config.ProviderConfig{
+			{
+				Name:    "upstream",
+				Type:    config.ProviderTypeOpenAICompatible,
+				BaseURL: upstream.URL + "/v1",
+				APIKey:  providerAPIKey,
+				Timeout: time.Second,
+			},
+		},
+		Models: []config.ModelConfig{
+			{Name: "default-chat", Provider: "upstream", UpstreamModel: "private-upstream"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/chat/completions",
+		strings.NewReader(`{"model":"default-chat","messages":[{"role":"user","content":"hello"}]}`),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+gatewayAPIKey)
+	recorder := httptest.NewRecorder()
+
+	application.server.Handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	receivedUpstreamRequest := <-upstreamRequests
+	if receivedUpstreamRequest.Authorization != "Bearer "+providerAPIKey ||
+		receivedUpstreamRequest.Model != "private-upstream" {
+		t.Fatalf("upstream request = %#v", receivedUpstreamRequest)
+	}
+	if strings.Contains(receivedUpstreamRequest.Authorization, gatewayAPIKey) {
+		t.Fatal("gateway API key was forwarded upstream")
+	}
+	var response openaiapi.ChatCompletionResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode gateway response: %v", err)
+	}
+	if response.Model != "default-chat" {
+		t.Fatalf("response model = %q", response.Model)
 	}
 }

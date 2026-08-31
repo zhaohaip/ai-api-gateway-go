@@ -10,6 +10,7 @@ import (
 
 	einopenai "github.com/cloudwego/eino-ext/components/model/openai"
 
+	"github.com/zhaohaip/ai-api-gateway-go/internal/auth"
 	chateino "github.com/zhaohaip/ai-api-gateway-go/internal/chat/adapter/eino"
 	chatapi "github.com/zhaohaip/ai-api-gateway-go/internal/chat/api"
 	"github.com/zhaohaip/ai-api-gateway-go/internal/chat/service"
@@ -31,6 +32,10 @@ func New(ctx context.Context, appConfig config.Config) (*App, error) {
 }
 
 func newApp(ctx context.Context, appConfig config.Config, factory providerFactory) (*App, error) {
+	authenticator, err := auth.NewMemoryAuthenticator(appConfig.Auth.APIKeys)
+	if err != nil {
+		return nil, fmt.Errorf("initialize API key authenticator: %w", err)
+	}
 	registry, err := buildModelRegistry(ctx, appConfig, factory)
 	if err != nil {
 		return nil, err
@@ -41,7 +46,7 @@ func newApp(ctx context.Context, appConfig config.Config, factory providerFactor
 	return &App{
 		server: &http.Server{
 			Addr:              appConfig.Address,
-			Handler:           chatapi.NewRouter(handler),
+			Handler:           chatapi.NewRouter(handler, authenticator),
 			ReadHeaderTimeout: 5 * time.Second,
 		},
 	}, nil

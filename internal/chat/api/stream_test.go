@@ -103,7 +103,7 @@ func TestHandlerStreamsOpenAICompatibleSSE(t *testing.T) {
 	recorder := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
 
 	performRequestWithWriter(
-		NewRouter(handler),
+		newTestRouter(t, handler),
 		recorder,
 		context.Background(),
 		streamRequestJSON(),
@@ -190,7 +190,7 @@ func TestHandlerFiltersMeaninglessChunksAndMapsReasoning(t *testing.T) {
 	recorder := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
 
 	performRequestWithWriter(
-		NewRouter(handler),
+		newTestRouter(t, handler),
 		recorder,
 		context.Background(),
 		streamRequestJSON(),
@@ -265,7 +265,7 @@ func TestHandlerStreamFailureBeforeFirstChunkReturnsJSONError(t *testing.T) {
 		},
 	})
 
-	recorder := performRequest(NewRouter(handler), context.Background(), streamRequestJSON(), "application/json")
+	recorder := performRequest(newTestRouter(t, handler), context.Background(), streamRequestJSON(), "application/json")
 	if recorder.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
@@ -292,7 +292,7 @@ func TestHandlerPartialStreamFailureStopsWithoutJSONOrDone(t *testing.T) {
 		},
 	})
 
-	recorder := performRequest(NewRouter(handler), context.Background(), streamRequestJSON(), "application/json")
+	recorder := performRequest(newTestRouter(t, handler), context.Background(), streamRequestJSON(), "application/json")
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
@@ -329,7 +329,7 @@ func TestHandlerStreamCancellationPropagatesAndCloses(t *testing.T) {
 		},
 	})
 
-	recorder := performRequest(NewRouter(handler), ctx, streamRequestJSON(), "application/json")
+	recorder := performRequest(newTestRouter(t, handler), ctx, streamRequestJSON(), "application/json")
 	if !errors.Is(providerContext.Err(), context.Canceled) {
 		t.Fatalf("provider context error = %v, want canceled", providerContext.Err())
 	}
@@ -349,7 +349,7 @@ func TestHandlerEmptyStreamReturnsJSONErrorAndCloses(t *testing.T) {
 		},
 	})
 
-	recorder := performRequest(NewRouter(handler), context.Background(), streamRequestJSON(), "application/json")
+	recorder := performRequest(newTestRouter(t, handler), context.Background(), streamRequestJSON(), "application/json")
 	if recorder.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
@@ -371,7 +371,7 @@ func TestHandlerStreamCreationFailureReturnsJSONError(t *testing.T) {
 		},
 	})
 
-	recorder := performRequest(NewRouter(handler), context.Background(), streamRequestJSON(), "application/json")
+	recorder := performRequest(newTestRouter(t, handler), context.Background(), streamRequestJSON(), "application/json")
 	if recorder.Code != http.StatusGatewayTimeout {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
@@ -390,7 +390,7 @@ func TestHandlerRejectsWriterWithoutFlush(t *testing.T) {
 	})
 	writer := newBasicResponseWriter()
 
-	performRequestWithWriter(NewRouter(handler), writer, context.Background(), streamRequestJSON(), "application/json")
+	performRequestWithWriter(newTestRouter(t, handler), writer, context.Background(), streamRequestJSON(), "application/json")
 	if writer.status != http.StatusInternalServerError {
 		t.Fatalf("status = %d, body = %s", writer.status, writer.body.String())
 	}
@@ -407,7 +407,7 @@ func TestHandlerStreamWithoutFinishReasonDoesNotSendDone(t *testing.T) {
 		},
 	})
 
-	recorder := performRequest(NewRouter(handler), context.Background(), streamRequestJSON(), "application/json")
+	recorder := performRequest(newTestRouter(t, handler), context.Background(), streamRequestJSON(), "application/json")
 	if strings.Contains(recorder.Body.String(), doneEvent) {
 		t.Fatalf("incomplete stream sent [DONE]: %s", recorder.Body.String())
 	}
@@ -479,6 +479,7 @@ func performRequestWithWriter(
 ) {
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)).WithContext(ctx)
 	request.Header.Set("Content-Type", contentType)
+	request.Header.Set("Authorization", "Bearer "+testGatewayAPIKey)
 	handler.ServeHTTP(writer, request)
 }
 

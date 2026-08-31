@@ -11,10 +11,14 @@ cp configs/gateway.yaml.example configs/gateway.yaml
 export AI_GATEWAY_CONFIG_FILE=configs/gateway.yaml
 export DEEPSEEK_API_KEY='your-key'
 export QWEN_API_KEY='your-key'
+export GATEWAY_DEMO_API_KEY='your-gateway-key'
+export GATEWAY_INTERNAL_API_KEY='your-internal-gateway-key'
 go run ./cmd/gateway
 ```
 
-API Key 不写入 YAML，只能通过各 Provider 的 `api_key_env` 指向的环境变量注入。配置会在启动时完整校验；配置无效、密钥缺失或 Provider 初始化失败时，进程直接启动失败。
+API Key 不写入 YAML。Provider API Key 继续通过 Provider 的 `api_key_env` 注入；客户端访问网关的 API Key 通过 `auth.api_keys[].key_env` 注入。客户端 Key 在加载后立即转换为 Hash，认证索引不保存可读取的明文值。配置会在启动时完整校验；配置无效、密钥缺失或 Provider 初始化失败时，进程直接启动失败。
+
+每个客户端 Key 可以通过 `allowed_models` 指定可访问的逻辑模型，`"*"` 表示全部已注册模型。禁用 Key、未知 Key 和格式错误的 Bearer Header 都返回统一的 `401 invalid_api_key`；无权访问模型返回 `403 model_access_denied`。
 
 每个 Provider 的 Eino ChatModel 和底层 HTTP Client 在应用启动时创建一次。同一 Provider 下的多个逻辑模型复用该实例，并通过 Eino 模型选项传递各自的 `upstream_model`。客户端 Context 会沿 Handler、Service、Provider 传递到 Eino `Generate` 或 `Stream`。
 
@@ -30,6 +34,7 @@ API Key 不写入 YAML，只能通过各 Provider 的 `api_key_env` 指向的环
 
 ```bash
 curl -N http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer ${GATEWAY_DEMO_API_KEY}" \
   -H 'Content-Type: application/json' \
   -d '{
     "model":"default-chat",
@@ -41,9 +46,12 @@ curl -N http://localhost:8080/v1/chat/completions \
 模型列表只返回公开逻辑模型，不包含 Provider 名称、Base URL 或上游模型名：
 
 ```bash
-curl http://localhost:8080/v1/models
+curl http://localhost:8080/v1/models \
+  -H "Authorization: Bearer ${GATEWAY_DEMO_API_KEY}"
 ```
 
-当前支持基于逻辑模型名的精确多模型路由，不支持权重路由、自动选择、自动重试和故障切换、Provider 健康检查、配置热更新、鉴权、网关限流/配额、SSE 心跳、Tool Calling 流式增量、Embedding、图片、音频、持久化、Chain、Graph 或 Agent。
+`POST /v1/chat/completions` 和 `GET /v1/models` 都要求 `Authorization: Bearer <gateway-api-key>`。模型列表只返回当前 Key 有权访问的逻辑模型。当前不支持 Key 管理接口、数据库存储、自动轮换、JWT、QPS 限流、并发限制、Token 配额或计费。
+
+当前支持基于逻辑模型名的精确多模型路由，不支持权重路由、自动选择、自动重试和故障切换、Provider 健康检查、配置热更新、网关限流/配额、SSE 心跳、Tool Calling 流式增量、Embedding、图片、音频、持久化、Chain、Graph 或 Agent。
 
 客户端主动取消请求时使用 HTTP `499` 和 `request_canceled` 错误码；其余上游错误分别映射为 `429`、`504` 或 `502`，原始上游错误不会透传。

@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	gatewayauth "github.com/zhaohaip/ai-api-gateway-go/internal/auth"
 	"github.com/zhaohaip/ai-api-gateway-go/internal/chat/domain"
 	"github.com/zhaohaip/ai-api-gateway-go/internal/chat/service"
 )
@@ -18,6 +19,7 @@ import (
 // Handler 处理 OpenAI 兼容聊天请求。
 type Handler struct {
 	chatService *service.ChatService
+	authorizer  gatewayauth.ModelAuthorizer
 	newID       func() (string, error)
 	now         func() time.Time
 	logger      *slog.Logger
@@ -27,6 +29,7 @@ type Handler struct {
 func NewHandler(chatService *service.ChatService) *Handler {
 	return &Handler{
 		chatService: chatService,
+		authorizer:  gatewayauth.ModelAuthorizer{},
 		newID:       newCompletionID,
 		now:         time.Now,
 		logger:      slog.Default(),
@@ -53,6 +56,15 @@ func (h *Handler) CreateChatCompletion(c *gin.Context) {
 		h.writeError(c, err)
 		return
 	}
+	principal, exists := gatewayauth.PrincipalFromContext(c.Request.Context())
+	if !exists {
+		h.writeError(c, gatewayauth.NewAuthenticationError())
+		return
+	}
+	if err := h.authorizer.Authorize(principal, request.Model); err != nil {
+		h.writeError(c, err)
+		return
+	}
 
 	domainRequest := toDomainRequest(request)
 	if request.Stream {
@@ -64,7 +76,19 @@ func (h *Handler) CreateChatCompletion(c *gin.Context) {
 
 // ListModels 处理 GET /v1/models。
 func (h *Handler) ListModels(c *gin.Context) {
-	c.JSON(http.StatusOK, toOpenAIModelList(h.chatService.ListModels(), h.now().Unix()))
+	principal, exists := gatewayauth.PrincipalFromContext(c.Request.Context())
+	if !exists {
+		h.writeError(c, gatewayauth.NewAuthenticationError())
+		return
+	}
+	models := h.chatService.ListModels()
+	allowedModels := models[:0]
+	for _, model := range models {
+		if h.authorizer.Allows(principal, model.ID) {
+			allowedModels = append(allowedModels, model)
+		}
+	}
+	c.JSON(http.StatusOK, toOpenAIModelList(allowedModels, h.now().Unix()))
 }
 
 func (h *Handler) generateChatCompletion(c *gin.Context, requestedModel string, request domain.ChatRequest) {
@@ -82,8 +106,7 @@ func (h *Handler) generateChatCompletion(c *gin.Context, requestedModel string, 
 }
 
 func (h *Handler) writeError(c *gin.Context, err error) {
-	status, response := toHTTPError(err)
-	c.AbortWithStatusJSON(status, response)
+	writeHTTPError(c, err)
 }
 
 func isJSONContentType(value string) bool {

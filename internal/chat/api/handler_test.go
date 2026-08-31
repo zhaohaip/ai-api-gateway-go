@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -14,9 +15,12 @@ import (
 	"github.com/gin-gonic/gin"
 
 	openaiapi "github.com/zhaohaip/ai-api-gateway-go/api/openai"
+	gatewayauth "github.com/zhaohaip/ai-api-gateway-go/internal/auth"
 	"github.com/zhaohaip/ai-api-gateway-go/internal/chat/domain"
 	"github.com/zhaohaip/ai-api-gateway-go/internal/chat/service"
 )
+
+const testGatewayAPIKey = "sk-gw-test-client"
 
 type handlerFakeProvider struct {
 	generate func(context.Context, domain.ChatRequest) (domain.ChatResponse, error)
@@ -76,7 +80,7 @@ func TestHandlerValidRequestAndOpenAIResponse(t *testing.T) {
 	handler.newID = func() (string, error) { return "chatcmpl-test", nil }
 	handler.now = func() time.Time { return time.Unix(1787880000, 0) }
 
-	recorder := performRequest(NewRouter(handler), context.Background(), `{
+	recorder := performRequest(newTestRouter(t, handler), context.Background(), `{
 		"model":"default-chat",
 		"messages":[{"role":"user","content":"你好"}],
 		"temperature":0.7,
@@ -136,7 +140,7 @@ func TestHandlerRequestValidation(t *testing.T) {
 				return domain.ChatResponse{}, nil
 			}}))
 
-			recorder := performRequest(NewRouter(handler), context.Background(), test.body, test.contentType)
+			recorder := performRequest(newTestRouter(t, handler), context.Background(), test.body, test.contentType)
 			if recorder.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, want 400; body = %s", recorder.Code, recorder.Body.String())
 			}
@@ -176,7 +180,7 @@ func TestHandlerDomainErrorMapping(t *testing.T) {
 			) (domain.ChatResponse, error) {
 				return domain.ChatResponse{}, test.err
 			}}))
-			recorder := performRequest(NewRouter(handler), context.Background(), validRequestJSON(), "application/json")
+			recorder := performRequest(newTestRouter(t, handler), context.Background(), validRequestJSON(), "application/json")
 			if recorder.Code != test.status {
 				t.Fatalf("status = %d, want %d", recorder.Code, test.status)
 			}
@@ -205,7 +209,7 @@ func TestHandlerPropagatesClientCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	recorder := performRequest(NewRouter(handler), ctx, validRequestJSON(), "application/json")
+	recorder := performRequest(newTestRouter(t, handler), ctx, validRequestJSON(), "application/json")
 	if !contextObserved {
 		t.Fatal("provider did not observe canceled request context")
 	}
@@ -225,7 +229,7 @@ func TestHandlerOmitsUnknownUsageAndReturnsNullFinishReason(t *testing.T) {
 		}, nil
 	}}))
 	handler.newID = func() (string, error) { return "chatcmpl-test", nil }
-	recorder := performRequest(NewRouter(handler), context.Background(), validRequestJSON(), "application/json")
+	recorder := performRequest(newTestRouter(t, handler), context.Background(), validRequestJSON(), "application/json")
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
@@ -242,7 +246,7 @@ func TestCompletionIDsAreUnique(t *testing.T) {
 		return domain.ChatResponse{Model: request.Model, Message: domain.Message{Role: domain.RoleAssistant, Content: "hello"}}, nil
 	}}
 	handler := NewHandler(newTestChatService(t, provider))
-	router := NewRouter(handler)
+	router := newTestRouter(t, handler)
 	first := performRequest(router, context.Background(), validRequestJSON(), "application/json")
 	second := performRequest(router, context.Background(), validRequestJSON(), "application/json")
 	var firstResponse, secondResponse openaiapi.ChatCompletionResponse
@@ -268,7 +272,7 @@ func TestHandlerUnknownModelReturnsOpenAIModelNotFound(t *testing.T) {
 	}}))
 
 	recorder := performRequest(
-		NewRouter(handler),
+		newTestRouter(t, handler),
 		context.Background(),
 		`{"model":"unknown-model","messages":[{"role":"user","content":"hello"}]}`,
 		"application/json",
@@ -309,9 +313,10 @@ func TestHandlerListsOnlyLogicalModelsInRegistrationOrder(t *testing.T) {
 	handler := NewHandler(service.NewChatService(registry))
 	handler.now = func() time.Time { return time.Unix(1787912515, 0) }
 	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	request.Header.Set("Authorization", "Bearer "+testGatewayAPIKey)
 	recorder := httptest.NewRecorder()
 
-	NewRouter(handler).ServeHTTP(recorder, request)
+	newTestRouter(t, handler).ServeHTTP(recorder, request)
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
@@ -351,9 +356,26 @@ func newTestChatService(t testing.TB, provider service.ChatProvider) *service.Ch
 	return service.NewChatService(registry)
 }
 
+func newTestRouter(t testing.TB, handler *Handler) http.Handler {
+	t.Helper()
+	authenticator, err := gatewayauth.NewMemoryAuthenticator([]gatewayauth.APIKey{
+		{
+			ID:            "test-client",
+			KeyHash:       sha256.Sum256([]byte(testGatewayAPIKey)),
+			Enabled:       true,
+			AllowedModels: []string{"*"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewMemoryAuthenticator() error = %v", err)
+	}
+	return NewRouter(handler, authenticator)
+}
+
 func performRequest(handler http.Handler, ctx context.Context, body, contentType string) *httptest.ResponseRecorder {
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body)).WithContext(ctx)
 	request.Header.Set("Content-Type", contentType)
+	request.Header.Set("Authorization", "Bearer "+testGatewayAPIKey)
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, request)
 	return recorder
