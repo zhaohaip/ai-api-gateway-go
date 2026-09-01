@@ -111,6 +111,31 @@ func TestBuildModelRegistryFailsWhenProviderInitializationFails(t *testing.T) {
 	}
 }
 
+func TestProviderHTTPClientUsesTransportTimeoutsWithoutWholeRequestTimeout(t *testing.T) {
+	client, err := newProviderHTTPClient(config.ProviderConfig{
+		ConnectTimeout:        2 * time.Second,
+		TLSHandshakeTimeout:   3 * time.Second,
+		ResponseHeaderTimeout: 4 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("newProviderHTTPClient() error = %v", err)
+	}
+	if client.Timeout != 0 {
+		t.Fatalf("http.Client.Timeout = %s, want disabled", client.Timeout)
+	}
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T", client.Transport)
+	}
+	if transport.TLSHandshakeTimeout != 3*time.Second ||
+		transport.ResponseHeaderTimeout != 4*time.Second {
+		t.Fatalf("transport timeouts = TLS %s, response header %s",
+			transport.TLSHandshakeTimeout,
+			transport.ResponseHeaderTimeout,
+		)
+	}
+}
+
 func TestAppRejectsInvalidRequestLimitConfiguration(t *testing.T) {
 	_, err := newApp(context.Background(), config.Config{
 		Auth: config.AuthConfig{APIKeys: []gatewayauth.APIKey{
@@ -146,6 +171,18 @@ func TestAppRejectsInvalidConcurrencyLimitConfiguration(t *testing.T) {
 		return nil, nil
 	})
 	if err == nil || !strings.Contains(err.Error(), "concurrency controller") {
+		t.Fatalf("newApp() error = %v", err)
+	}
+}
+
+func TestAppRejectsInvalidTimeoutConfiguration(t *testing.T) {
+	_, err := newApp(context.Background(), config.Config{
+		Timeouts: config.TimeoutConfig{NonStream: -time.Second},
+	}, func(context.Context, config.ProviderConfig, string) (service.ChatProvider, error) {
+		t.Fatal("invalid timeout configuration initialized provider")
+		return nil, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "timeouts.non_stream must be non-negative") {
 		t.Fatalf("newApp() error = %v", err)
 	}
 }

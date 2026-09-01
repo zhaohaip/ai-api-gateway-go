@@ -162,6 +162,7 @@ func TestChatServiceClassifiesUnexpectedProviderErrorAsInternal(t *testing.T) {
 type serviceFakeStream struct {
 	recvError  error
 	closeError error
+	closeCount int
 }
 
 func (s *serviceFakeStream) Recv() (domain.ChatChunk, error) {
@@ -169,7 +170,25 @@ func (s *serviceFakeStream) Recv() (domain.ChatChunk, error) {
 }
 
 func (s *serviceFakeStream) Close() error {
+	s.closeCount++
 	return s.closeError
+}
+
+func TestChatServiceClosesStreamReturnedWithInitializationError(t *testing.T) {
+	providerStream := &serviceFakeStream{}
+	chatService := newServiceForProvider(t, fakeProvider{
+		stream: func(_ context.Context, _ domain.ChatRequest) (domain.ChatStream, error) {
+			return providerStream, errors.New("initialization failed")
+		},
+	})
+
+	stream, err := chatService.Stream(context.Background(), domain.ChatRequest{Model: "default-chat"})
+	if err == nil || stream != nil {
+		t.Fatalf("Stream() = (%v, %v), want nil stream and error", stream, err)
+	}
+	if providerStream.closeCount != 1 {
+		t.Fatalf("provider stream Close() count = %d, want 1", providerStream.closeCount)
+	}
 }
 
 func TestChatServiceStreamNormalizesDeferredErrors(t *testing.T) {

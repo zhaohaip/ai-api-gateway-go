@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	gatewayauth "github.com/zhaohaip/ai-api-gateway-go/internal/auth"
 	"github.com/zhaohaip/ai-api-gateway-go/internal/chat/domain"
 	"github.com/zhaohaip/ai-api-gateway-go/internal/concurrencylimit"
 )
@@ -21,6 +23,7 @@ type responseWriterUnwrapper interface {
 
 func (h *Handler) streamChatCompletion(
 	c *gin.Context,
+	principal gatewayauth.Principal,
 	requestedModel string,
 	request domain.ChatRequest,
 	lease concurrencylimit.Lease,
@@ -38,17 +41,42 @@ func (h *Handler) streamChatCompletion(
 	}
 	created := h.now().Unix()
 
-	stream, err := h.chatService.Stream(c.Request.Context(), request)
+	timeoutState := newStreamTimeoutState(c.Request.Context(), h.timeouts.Stream, h.newTimer)
+	stream, err := h.chatService.Stream(timeoutState.Context(), request)
+	if timeout := timeoutFromContext(timeoutState.Context()); timeout != nil {
+		if stream != nil {
+			h.closeStream(stream, id)
+		}
+		timeoutState.Close()
+		h.handleStreamTimeout(c, principal.KeyID, requestedModel, false, timeout)
+		return
+	}
 	if err != nil {
+		timeoutState.Close()
 		h.writeError(c, err)
 		return
 	}
 	stream = newConcurrencyChatStream(stream, lease)
-	defer h.closeStream(stream, id)
+	defer func() {
+		timeoutState.Close()
+		h.closeStream(stream, id)
+	}()
 
 	sent, finished := false, false
 	for {
 		chunk, recvErr := stream.Recv()
+		if timeout := timeoutFromContext(timeoutState.Context()); timeout != nil {
+			h.handleStreamTimeout(c, principal.KeyID, requestedModel, sent, timeout)
+			return
+		}
+		if timeoutState.Context().Err() != nil {
+			h.logStreamError(
+				id,
+				"canceled",
+				canceledRequestError(context.Cause(timeoutState.Context())),
+			)
+			return
+		}
 		if errors.Is(recvErr, io.EOF) {
 			h.finishStream(c, flusher, id, sent, finished)
 			return
@@ -67,10 +95,15 @@ func (h *Handler) streamChatCompletion(
 			h.logStreamError(id, "protocol", upstreamStreamError("the upstream stream returned data after finishing"))
 			return
 		}
+		timeoutState.FirstChunkReceived()
 
 		payload, marshalErr := json.Marshal(toOpenAIChunk(id, created, requestedModel, chunk, !sent))
 		if marshalErr != nil {
 			h.handleStreamError(c, id, sent, "marshal", domain.NewInternalError(marshalErr))
+			return
+		}
+		if timeout := timeoutFromContext(timeoutState.Context()); timeout != nil {
+			h.handleStreamTimeout(c, principal.KeyID, requestedModel, sent, timeout)
 			return
 		}
 		if !sent {
@@ -81,8 +114,24 @@ func (h *Handler) streamChatCompletion(
 			return
 		}
 		sent = true
+		timeoutState.OutputSent()
 		finished = chunk.FinishReason != nil
 	}
+}
+
+func (h *Handler) handleStreamTimeout(
+	c *gin.Context,
+	keyID string,
+	model string,
+	responseCommitted bool,
+	timeout *gatewayTimeout,
+) {
+	h.logTimeout(c, keyID, model, true, timeout, responseCommitted)
+	if !responseCommitted {
+		h.writeError(c, timeoutDomainError(timeout))
+		return
+	}
+	// SSE 已提交后只能终止连接，不能追加普通 JSON 错误或伪造 [DONE]。
 }
 
 func (h *Handler) finishStream(c *gin.Context, flusher http.Flusher, id string, sent, finished bool) {

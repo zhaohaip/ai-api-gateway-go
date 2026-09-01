@@ -30,6 +30,12 @@ limits:
     requests_per_second: 5
     burst: 10
     max_concurrency: 3
+timeouts:
+  non_stream: 60s
+  stream:
+    first_chunk: 15s
+    idle: 30s
+    total: 5m
 providers:
   - name: deepseek
     type: openai-compatible
@@ -85,6 +91,113 @@ func TestLoadMultipleProvidersAndModels(t *testing.T) {
 		config.Limits.DefaultAPIKey.Rate.RequestsPerSecond != 5 ||
 		config.Limits.DefaultAPIKey.Rate.Burst != 10 || config.Limits.DefaultAPIKey.MaxConcurrency != 3 {
 		t.Fatalf("limits = %#v", config.Limits)
+	}
+	if config.Timeouts.NonStream != time.Minute || config.Timeouts.Stream.FirstChunk != 15*time.Second ||
+		config.Timeouts.Stream.Idle != 30*time.Second || config.Timeouts.Stream.Total != 5*time.Minute {
+		t.Fatalf("timeouts = %#v", config.Timeouts)
+	}
+}
+
+func TestParseValidatesTimeouts(t *testing.T) {
+	baseConfig := `auth:
+  api_keys:
+    - {id: client, key_env: CLIENT_KEY, enabled: true, allowed_models: [chat]}
+` + singleProviderYAML() + validSingleModelYAML()
+	tests := []struct {
+		name     string
+		timeouts string
+		wantErr  string
+	}{
+		{
+			name: "invalid duration",
+			timeouts: `timeouts:
+  non_stream: never
+`,
+			wantErr: "timeouts.non_stream is invalid",
+		},
+		{
+			name: "negative duration",
+			timeouts: `timeouts:
+  stream: {idle: -1s}
+`,
+			wantErr: "timeouts.stream.idle must be non-negative",
+		},
+		{
+			name: "total shorter than first chunk",
+			timeouts: `timeouts:
+  stream: {first_chunk: 2s, total: 1s}
+`,
+			wantErr: "total must not be less than first_chunk",
+		},
+		{
+			name: "total shorter than idle",
+			timeouts: `timeouts:
+  stream: {idle: 2s, total: 1s}
+`,
+			wantErr: "total must not be less than idle",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := parse([]byte(test.timeouts+baseConfig), mapLookup(map[string]string{
+				"KEY":        "provider",
+				"CLIENT_KEY": "client",
+			}))
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("parse() error = %v, want containing %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestParseTreatsZeroTimeoutsAsDisabled(t *testing.T) {
+	contents := `timeouts:
+  non_stream: 0s
+  stream: {first_chunk: 0s, idle: 0s, total: 0s}
+auth:
+  api_keys:
+    - {id: client, key_env: CLIENT_KEY, enabled: true, allowed_models: [chat]}
+` + singleProviderYAML() + validSingleModelYAML()
+	config, err := parse([]byte(contents), mapLookup(map[string]string{
+		"KEY":        "provider",
+		"CLIENT_KEY": "client",
+	}))
+	if err != nil {
+		t.Fatalf("parse() error = %v", err)
+	}
+	if config.Timeouts != (TimeoutConfig{}) {
+		t.Fatalf("timeouts = %#v", config.Timeouts)
+	}
+}
+
+func TestParseSupportsExplicitProviderTransportTimeouts(t *testing.T) {
+	contents := `providers:
+  - name: provider
+    type: openai-compatible
+    base_url: https://provider.example/v1
+    api_key_env: KEY
+    connect_timeout: 2s
+    tls_handshake_timeout: 3s
+    response_header_timeout: 4s
+models:
+  - name: chat
+    provider: provider
+    upstream_model: upstream
+auth:
+  api_keys:
+    - {id: client, key_env: CLIENT_KEY, enabled: true, allowed_models: [chat]}
+`
+	config, err := parse([]byte(contents), mapLookup(map[string]string{
+		"KEY":        "provider",
+		"CLIENT_KEY": "client",
+	}))
+	if err != nil {
+		t.Fatalf("parse() error = %v", err)
+	}
+	provider := config.Providers[0]
+	if provider.Timeout != 0 || provider.ConnectTimeout != 2*time.Second ||
+		provider.TLSHandshakeTimeout != 3*time.Second || provider.ResponseHeaderTimeout != 4*time.Second {
+		t.Fatalf("provider timeouts = %#v", provider)
 	}
 }
 

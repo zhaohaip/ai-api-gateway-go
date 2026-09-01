@@ -26,6 +26,8 @@ type Handler struct {
 	authorizer  gatewayauth.ModelAuthorizer
 	limiter     ratelimit.Limiter
 	concurrency concurrencylimit.Controller
+	timeouts    Timeouts
+	newTimer    timeoutTimerFactory
 	newID       func() (string, error)
 	now         func() time.Time
 	logger      *slog.Logger
@@ -47,11 +49,23 @@ func NewHandlerWithRequestControls(
 	limiter ratelimit.Limiter,
 	concurrencyController concurrencylimit.Controller,
 ) *Handler {
+	return NewHandlerWithTimeouts(chatService, limiter, concurrencyController, Timeouts{})
+}
+
+// NewHandlerWithTimeouts 创建使用指定请求控制和业务超时的聊天 HTTP Handler。
+func NewHandlerWithTimeouts(
+	chatService *service.ChatService,
+	limiter ratelimit.Limiter,
+	concurrencyController concurrencylimit.Controller,
+	timeouts Timeouts,
+) *Handler {
 	return &Handler{
 		chatService: chatService,
 		authorizer:  gatewayauth.ModelAuthorizer{},
 		limiter:     limiter,
 		concurrency: concurrencyController,
+		timeouts:    timeouts,
+		newTimer:    realTimeoutTimer,
 		newID:       newCompletionID,
 		now:         time.Now,
 		logger:      slog.Default(),
@@ -97,11 +111,11 @@ func (h *Handler) CreateChatCompletion(c *gin.Context) {
 
 	domainRequest := toDomainRequest(request)
 	if request.Stream {
-		h.streamChatCompletion(c, request.Model, domainRequest, lease)
+		h.streamChatCompletion(c, principal, request.Model, domainRequest, lease)
 		return
 	}
 	defer lease.Release()
-	h.generateChatCompletion(c, request.Model, domainRequest)
+	h.generateChatCompletion(c, principal, request.Model, domainRequest)
 }
 
 // ListModels 处理 GET /v1/models。
@@ -173,8 +187,25 @@ func (h *Handler) acquireConcurrency(
 	return nil, false
 }
 
-func (h *Handler) generateChatCompletion(c *gin.Context, requestedModel string, request domain.ChatRequest) {
-	response, err := h.chatService.Generate(c.Request.Context(), request)
+func (h *Handler) generateChatCompletion(
+	c *gin.Context,
+	principal gatewayauth.Principal,
+	requestedModel string,
+	request domain.ChatRequest,
+) {
+	callContext, stopTimeout := newCallTimeoutContext(
+		c.Request.Context(),
+		h.timeouts.NonStream,
+		timeoutTypeNonStream,
+		h.newTimer,
+	)
+	defer stopTimeout()
+	response, err := h.chatService.Generate(callContext, request)
+	if timeout := timeoutFromContext(callContext); timeout != nil {
+		h.logTimeout(c, principal.KeyID, requestedModel, false, timeout, false)
+		h.writeError(c, timeoutDomainError(timeout))
+		return
+	}
 	if err != nil {
 		h.writeError(c, err)
 		return

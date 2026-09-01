@@ -30,6 +30,7 @@ type Config struct {
 	Address   string
 	Auth      AuthConfig
 	Limits    LimitsConfig
+	Timeouts  TimeoutConfig
 	Providers []ProviderConfig
 	Models    []ModelConfig
 }
@@ -51,14 +52,55 @@ type RequestLimits struct {
 	MaxConcurrency int
 }
 
+// TimeoutConfig 表示非流式和 SSE 请求的业务超时。
+type TimeoutConfig struct {
+	NonStream time.Duration
+	Stream    StreamTimeoutConfig
+}
+
+// StreamTimeoutConfig 表示 SSE 首包、空闲和总时长超时。
+type StreamTimeoutConfig struct {
+	FirstChunk time.Duration
+	Idle       time.Duration
+	Total      time.Duration
+}
+
+// Validate 校验业务超时值及其组合关系；0 表示禁用对应超时。
+func (c TimeoutConfig) Validate() error {
+	values := []struct {
+		name     string
+		duration time.Duration
+	}{
+		{name: "timeouts.non_stream", duration: c.NonStream},
+		{name: "timeouts.stream.first_chunk", duration: c.Stream.FirstChunk},
+		{name: "timeouts.stream.idle", duration: c.Stream.Idle},
+		{name: "timeouts.stream.total", duration: c.Stream.Total},
+	}
+	for _, value := range values {
+		if value.duration < 0 {
+			return fmt.Errorf("%s must be non-negative", value.name)
+		}
+	}
+	if c.Stream.Total > 0 && c.Stream.FirstChunk > 0 && c.Stream.Total < c.Stream.FirstChunk {
+		return fmt.Errorf("timeouts.stream.total must not be less than first_chunk")
+	}
+	if c.Stream.Total > 0 && c.Stream.Idle > 0 && c.Stream.Total < c.Stream.Idle {
+		return fmt.Errorf("timeouts.stream.total must not be less than idle")
+	}
+	return nil
+}
+
 // ProviderConfig 表示一个上游服务连接配置。
 type ProviderConfig struct {
-	Name      string
-	Type      string
-	BaseURL   string
-	APIKeyEnv string
-	APIKey    string
-	Timeout   time.Duration
+	Name                  string
+	Type                  string
+	BaseURL               string
+	APIKeyEnv             string
+	APIKey                string
+	Timeout               time.Duration
+	ConnectTimeout        time.Duration
+	TLSHandshakeTimeout   time.Duration
+	ResponseHeaderTimeout time.Duration
 }
 
 // ModelConfig 表示一个对外逻辑模型到上游模型的映射。
@@ -72,6 +114,7 @@ type fileConfig struct {
 	Address   string               `yaml:"address"`
 	Auth      fileAuthConfig       `yaml:"auth"`
 	Limits    fileLimitsConfig     `yaml:"limits"`
+	Timeouts  fileTimeoutConfig    `yaml:"timeouts"`
 	Providers []fileProviderConfig `yaml:"providers"`
 	Models    []ModelConfig        `yaml:"models"`
 }
@@ -91,6 +134,17 @@ type fileLimitConfig struct {
 	MaxConcurrency    int     `yaml:"max_concurrency"`
 }
 
+type fileTimeoutConfig struct {
+	NonStream string                  `yaml:"non_stream"`
+	Stream    fileStreamTimeoutConfig `yaml:"stream"`
+}
+
+type fileStreamTimeoutConfig struct {
+	FirstChunk string `yaml:"first_chunk"`
+	Idle       string `yaml:"idle"`
+	Total      string `yaml:"total"`
+}
+
 type fileAPIKeyConfig struct {
 	ID            string   `yaml:"id"`
 	KeyEnv        string   `yaml:"key_env"`
@@ -99,11 +153,14 @@ type fileAPIKeyConfig struct {
 }
 
 type fileProviderConfig struct {
-	Name      string `yaml:"name"`
-	Type      string `yaml:"type"`
-	BaseURL   string `yaml:"base_url"`
-	APIKeyEnv string `yaml:"api_key_env"`
-	Timeout   string `yaml:"timeout"`
+	Name                  string `yaml:"name"`
+	Type                  string `yaml:"type"`
+	BaseURL               string `yaml:"base_url"`
+	APIKeyEnv             string `yaml:"api_key_env"`
+	Timeout               string `yaml:"timeout"`
+	ConnectTimeout        string `yaml:"connect_timeout"`
+	TLSHandshakeTimeout   string `yaml:"tls_handshake_timeout"`
+	ResponseHeaderTimeout string `yaml:"response_header_timeout"`
 }
 
 // Load 从 AI_GATEWAY_CONFIG_FILE 指定的 YAML 文件加载并校验配置。
@@ -134,8 +191,13 @@ func parse(contents []byte, lookupEnv func(string) (string, bool)) (Config, erro
 		return Config{}, fmt.Errorf("gateway config must contain one YAML document")
 	}
 
+	timeouts, err := parseTimeouts(loaded.Timeouts)
+	if err != nil {
+		return Config{}, err
+	}
 	config := Config{
-		Address: strings.TrimSpace(loaded.Address),
+		Address:  strings.TrimSpace(loaded.Address),
+		Timeouts: timeouts,
 		Limits: LimitsConfig{
 			Global: RequestLimits{
 				Rate: ratelimit.Limit{
@@ -210,6 +272,52 @@ func parse(contents []byte, lookupEnv func(string) (string, bool)) (Config, erro
 	}
 	config.Auth.APIKeys = apiKeys
 	return config, nil
+}
+
+func parseTimeouts(loaded fileTimeoutConfig) (TimeoutConfig, error) {
+	nonStream, err := parseOptionalDuration("timeouts.non_stream", loaded.NonStream)
+	if err != nil {
+		return TimeoutConfig{}, err
+	}
+	firstChunk, err := parseOptionalDuration("timeouts.stream.first_chunk", loaded.Stream.FirstChunk)
+	if err != nil {
+		return TimeoutConfig{}, err
+	}
+	idle, err := parseOptionalDuration("timeouts.stream.idle", loaded.Stream.Idle)
+	if err != nil {
+		return TimeoutConfig{}, err
+	}
+	total, err := parseOptionalDuration("timeouts.stream.total", loaded.Stream.Total)
+	if err != nil {
+		return TimeoutConfig{}, err
+	}
+	timeouts := TimeoutConfig{
+		NonStream: nonStream,
+		Stream: StreamTimeoutConfig{
+			FirstChunk: firstChunk,
+			Idle:       idle,
+			Total:      total,
+		},
+	}
+	if err := timeouts.Validate(); err != nil {
+		return TimeoutConfig{}, err
+	}
+	return timeouts, nil
+}
+
+func parseOptionalDuration(name, value string) (time.Duration, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, nil
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("%s is invalid: %w", name, err)
+	}
+	if duration < 0 {
+		return 0, fmt.Errorf("%s must be non-negative", name)
+	}
+	return duration, nil
 }
 
 func validateLimits(limits LimitsConfig) error {
@@ -298,6 +406,9 @@ func validateProvider(
 	provider.BaseURL = strings.TrimSpace(provider.BaseURL)
 	provider.APIKeyEnv = strings.TrimSpace(provider.APIKeyEnv)
 	provider.Timeout = strings.TrimSpace(provider.Timeout)
+	provider.ConnectTimeout = strings.TrimSpace(provider.ConnectTimeout)
+	provider.TLSHandshakeTimeout = strings.TrimSpace(provider.TLSHandshakeTimeout)
+	provider.ResponseHeaderTimeout = strings.TrimSpace(provider.ResponseHeaderTimeout)
 
 	if provider.Name == "" {
 		return ProviderConfig{}, fmt.Errorf("providers[%d].name is required", index)
@@ -319,21 +430,74 @@ func validateProvider(
 			provider.APIKeyEnv,
 		)
 	}
-	timeout, err := time.ParseDuration(provider.Timeout)
-	if err != nil {
-		return ProviderConfig{}, fmt.Errorf("provider %q timeout is invalid: %w", provider.Name, err)
+	var legacyTimeout time.Duration
+	var err error
+	if provider.Timeout != "" {
+		legacyTimeout, err = parseProviderTimeout(provider.Name, "timeout", provider.Timeout, 0)
+		if err != nil {
+			return ProviderConfig{}, err
+		}
 	}
-	if timeout <= 0 {
-		return ProviderConfig{}, fmt.Errorf("provider %q timeout must be greater than zero", provider.Name)
+	connectTimeout, err := parseProviderTimeout(
+		provider.Name,
+		"connect_timeout",
+		provider.ConnectTimeout,
+		legacyTimeout,
+	)
+	if err != nil {
+		return ProviderConfig{}, err
+	}
+	tlsHandshakeTimeout, err := parseProviderTimeout(
+		provider.Name,
+		"tls_handshake_timeout",
+		provider.TLSHandshakeTimeout,
+		legacyTimeout,
+	)
+	if err != nil {
+		return ProviderConfig{}, err
+	}
+	responseHeaderTimeout, err := parseProviderTimeout(
+		provider.Name,
+		"response_header_timeout",
+		provider.ResponseHeaderTimeout,
+		legacyTimeout,
+	)
+	if err != nil {
+		return ProviderConfig{}, err
 	}
 	return ProviderConfig{
-		Name:      provider.Name,
-		Type:      provider.Type,
-		BaseURL:   provider.BaseURL,
-		APIKeyEnv: provider.APIKeyEnv,
-		APIKey:    strings.TrimSpace(apiKey),
-		Timeout:   timeout,
+		Name:                  provider.Name,
+		Type:                  provider.Type,
+		BaseURL:               provider.BaseURL,
+		APIKeyEnv:             provider.APIKeyEnv,
+		APIKey:                strings.TrimSpace(apiKey),
+		Timeout:               legacyTimeout,
+		ConnectTimeout:        connectTimeout,
+		TLSHandshakeTimeout:   tlsHandshakeTimeout,
+		ResponseHeaderTimeout: responseHeaderTimeout,
 	}, nil
+}
+
+func parseProviderTimeout(
+	providerName string,
+	fieldName string,
+	value string,
+	fallback time.Duration,
+) (time.Duration, error) {
+	if value == "" {
+		if fallback > 0 {
+			return fallback, nil
+		}
+		return 0, fmt.Errorf("provider %q %s is required", providerName, fieldName)
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("provider %q %s is invalid: %w", providerName, fieldName, err)
+	}
+	if duration <= 0 {
+		return 0, fmt.Errorf("provider %q %s must be greater than zero", providerName, fieldName)
+	}
+	return duration, nil
 }
 
 func validateBaseURL(value string) error {

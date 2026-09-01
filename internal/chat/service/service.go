@@ -48,6 +48,9 @@ func (s *ChatService) Stream(ctx context.Context, req domain.ChatRequest) (domai
 	}
 	stream, err := route.Provider.Stream(ctx, providerRequest)
 	if err != nil {
+		if stream != nil {
+			_ = stream.Close()
+		}
 		return nil, normalizeProviderError(err, "create chat completion stream")
 	}
 	return &chatStream{stream: stream}, nil
@@ -56,6 +59,15 @@ func (s *ChatService) Stream(ctx context.Context, req domain.ChatRequest) (domai
 // ListModels 按稳定顺序返回已注册的逻辑模型。
 func (s *ChatService) ListModels() []ModelInfo {
 	return s.registry.List()
+}
+
+// ProviderName 返回逻辑模型对应的非敏感 Provider 名称，仅用于运行日志。
+func (s *ChatService) ProviderName(model string) string {
+	route, err := s.registry.Resolve(model)
+	if err != nil {
+		return ""
+	}
+	return route.ProviderName
 }
 
 func (s *ChatService) resolveRequest(req domain.ChatRequest) (ModelRoute, domain.ChatRequest, error) {

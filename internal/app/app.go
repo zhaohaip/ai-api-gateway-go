@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"time"
 
@@ -34,6 +35,9 @@ func New(ctx context.Context, appConfig config.Config) (*App, error) {
 }
 
 func newApp(ctx context.Context, appConfig config.Config, factory providerFactory) (*App, error) {
+	if err := appConfig.Timeouts.Validate(); err != nil {
+		return nil, fmt.Errorf("validate timeout configuration: %w", err)
+	}
 	authenticator, err := auth.NewMemoryAuthenticator(appConfig.Auth.APIKeys)
 	if err != nil {
 		return nil, fmt.Errorf("initialize API key authenticator: %w", err)
@@ -54,7 +58,19 @@ func newApp(ctx context.Context, appConfig config.Config, factory providerFactor
 		return nil, err
 	}
 	chatService := service.NewChatService(registry)
-	handler := chatapi.NewHandlerWithRequestControls(chatService, limiter, concurrencyController)
+	handler := chatapi.NewHandlerWithTimeouts(
+		chatService,
+		limiter,
+		concurrencyController,
+		chatapi.Timeouts{
+			NonStream: appConfig.Timeouts.NonStream,
+			Stream: chatapi.StreamTimeouts{
+				FirstChunk: appConfig.Timeouts.Stream.FirstChunk,
+				Idle:       appConfig.Timeouts.Stream.Idle,
+				Total:      appConfig.Timeouts.Stream.Total,
+			},
+		},
+	)
 
 	return &App{
 		server: &http.Server{
@@ -73,16 +89,45 @@ func newEinoProvider(
 	if providerConfig.Type != config.ProviderTypeOpenAICompatible {
 		return nil, fmt.Errorf("provider %q has unsupported type %q", providerConfig.Name, providerConfig.Type)
 	}
+	httpClient, err := newProviderHTTPClient(providerConfig)
+	if err != nil {
+		return nil, err
+	}
 	chatModel, err := einopenai.NewChatModel(ctx, &einopenai.ChatModelConfig{
-		BaseURL: providerConfig.BaseURL,
-		APIKey:  providerConfig.APIKey,
-		Model:   defaultModel,
-		Timeout: providerConfig.Timeout,
+		BaseURL:    providerConfig.BaseURL,
+		APIKey:     providerConfig.APIKey,
+		Model:      defaultModel,
+		HTTPClient: httpClient,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("initialize Eino OpenAI ChatModel: %w", err)
 	}
 	return chateino.NewProvider(chatModel), nil
+}
+
+func newProviderHTTPClient(providerConfig config.ProviderConfig) (*http.Client, error) {
+	defaultTransport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return nil, fmt.Errorf("default HTTP transport has unexpected type %T", http.DefaultTransport)
+	}
+	connectTimeout := providerConfig.ConnectTimeout
+	if connectTimeout == 0 {
+		connectTimeout = providerConfig.Timeout
+	}
+	tlsHandshakeTimeout := providerConfig.TLSHandshakeTimeout
+	if tlsHandshakeTimeout == 0 {
+		tlsHandshakeTimeout = providerConfig.Timeout
+	}
+	responseHeaderTimeout := providerConfig.ResponseHeaderTimeout
+	if responseHeaderTimeout == 0 {
+		responseHeaderTimeout = providerConfig.Timeout
+	}
+	dialer := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
+	transport := defaultTransport.Clone()
+	transport.DialContext = dialer.DialContext
+	transport.TLSHandshakeTimeout = tlsHandshakeTimeout
+	transport.ResponseHeaderTimeout = responseHeaderTimeout
+	return &http.Client{Transport: transport}, nil
 }
 
 func buildModelRegistry(
