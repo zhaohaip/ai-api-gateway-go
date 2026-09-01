@@ -22,6 +22,8 @@ API Key 不写入 YAML。Provider API Key 继续通过 Provider 的 `api_key_env
 
 `limits.global` 配置单实例全局请求频率，`limits.default_api_key` 配置每个 `Principal.KeyID` 的独立频率。两项都采用令牌桶，`requests_per_second` 表示令牌补充速率，`burst` 表示桶容量；同一项的两个字段都为 `0` 时禁用该项限制，其他情况下必须都大于 `0`。请求必须同时满足全局和 KeyID 额度，超限立即返回 `429 rate_limit_exceeded`，不会排队。可计算恢复时间时响应包含按秒向上取整的 `Retry-After`。
 
+同一配置范围内的 `max_concurrency` 控制正在处理的请求数量，`0` 表示禁用该范围的并发限制，负数会导致启动失败。请求在频率限流通过后按“全局、KeyID”的顺序获取槽位，任一级达到上限都会立即返回 `429 concurrency_limit_exceeded`。非流式请求在 Handler 结束时释放；SSE 请求通过内部 Stream 包装器将槽位保持到 EOF、读取错误、取消或 Close，并确保重复关闭只释放一次。
+
 每个 Provider 的 Eino ChatModel 和底层 HTTP Client 在应用启动时创建一次。同一 Provider 下的多个逻辑模型复用该实例，并通过 Eino 模型选项传递各自的 `upstream_model`。客户端 Context 会沿 Handler、Service、Provider 传递到 Eino `Generate` 或 `Stream`。
 
 ## 兼容范围
@@ -52,8 +54,8 @@ curl http://localhost:8080/v1/models \
   -H "Authorization: Bearer ${GATEWAY_DEMO_API_KEY}"
 ```
 
-`POST /v1/chat/completions` 和 `GET /v1/models` 都要求 `Authorization: Bearer <gateway-api-key>`，并计入请求频率限制。模型列表只返回当前 Key 有权访问的逻辑模型。当前不支持 Key 管理接口、数据库存储、自动轮换、JWT、并发限制、Token 配额或计费。
+`POST /v1/chat/completions` 和 `GET /v1/models` 都要求 `Authorization: Bearer <gateway-api-key>`，并计入请求频率和并发限制。模型列表只返回当前 Key 有权访问的逻辑模型。当前不支持 Key 管理接口、数据库存储、自动轮换、JWT、Token 配额或计费。
 
-当前支持基于逻辑模型名的精确多模型路由和单实例内存请求限流，不支持分布式共享额度、权重路由、自动选择、自动重试和故障切换、Provider 健康检查、配置热更新、Token 配额、SSE 心跳、Tool Calling 流式增量、Embedding、图片、音频、持久化、Chain、Graph 或 Agent。
+当前支持基于逻辑模型名的精确多模型路由、单实例内存请求限流和并发控制，不支持多实例共享额度、请求排队、动态并发配额、权重路由、自动选择、自动重试和故障切换、Provider 健康检查、配置热更新、Token 配额、SSE 心跳、Tool Calling 流式增量、Embedding、图片、音频、持久化、Chain、Graph 或 Agent。
 
 客户端主动取消请求时使用 HTTP `499` 和 `request_canceled` 错误码；其余上游错误分别映射为 `429`、`504` 或 `502`，原始上游错误不会透传。

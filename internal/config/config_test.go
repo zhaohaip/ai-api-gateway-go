@@ -7,8 +7,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/zhaohaip/ai-api-gateway-go/internal/ratelimit"
 )
 
 const validConfigYAML = `
@@ -27,9 +25,11 @@ limits:
   global:
     requests_per_second: 100
     burst: 200
+    max_concurrency: 50
   default_api_key:
     requests_per_second: 5
     burst: 10
+    max_concurrency: 3
 providers:
   - name: deepseek
     type: openai-compatible
@@ -80,8 +80,10 @@ func TestLoadMultipleProvidersAndModels(t *testing.T) {
 	if len(config.Auth.APIKeys) != 2 || config.Auth.APIKeys[0].KeyHash != sha256.Sum256([]byte("sk-gw-demo")) {
 		t.Fatalf("client API keys = %#v", config.Auth.APIKeys)
 	}
-	if config.Limits.Global.RequestsPerSecond != 100 || config.Limits.Global.Burst != 200 ||
-		config.Limits.DefaultAPIKey.RequestsPerSecond != 5 || config.Limits.DefaultAPIKey.Burst != 10 {
+	if config.Limits.Global.Rate.RequestsPerSecond != 100 || config.Limits.Global.Rate.Burst != 200 ||
+		config.Limits.Global.MaxConcurrency != 50 ||
+		config.Limits.DefaultAPIKey.Rate.RequestsPerSecond != 5 ||
+		config.Limits.DefaultAPIKey.Rate.Burst != 10 || config.Limits.DefaultAPIKey.MaxConcurrency != 3 {
 		t.Fatalf("limits = %#v", config.Limits)
 	}
 }
@@ -124,6 +126,20 @@ func TestParseValidatesRequestLimits(t *testing.T) {
 `,
 			wantErr: "must both be zero or greater than zero",
 		},
+		{
+			name: "negative global concurrency",
+			limits: `limits:
+  global: {max_concurrency: -1}
+`,
+			wantErr: "global max_concurrency must be non-negative",
+		},
+		{
+			name: "negative API key concurrency",
+			limits: `limits:
+  default_api_key: {max_concurrency: -1}
+`,
+			wantErr: "default_api_key max_concurrency must be non-negative",
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -141,7 +157,7 @@ func TestParseValidatesRequestLimits(t *testing.T) {
 func TestParseTreatsZeroRequestLimitsAsDisabled(t *testing.T) {
 	contents := `limits:
   global: {requests_per_second: 0, burst: 0}
-  default_api_key: {requests_per_second: 0, burst: 0}
+  default_api_key: {requests_per_second: 0, burst: 0, max_concurrency: 0}
 auth:
   api_keys:
     - {id: client, key_env: CLIENT_KEY, enabled: true, allowed_models: [chat]}
@@ -153,7 +169,7 @@ auth:
 	if err != nil {
 		t.Fatalf("parse() error = %v", err)
 	}
-	if config.Limits.Global != (ratelimit.Limit{}) || config.Limits.DefaultAPIKey != (ratelimit.Limit{}) {
+	if config.Limits.Global != (RequestLimits{}) || config.Limits.DefaultAPIKey != (RequestLimits{}) {
 		t.Fatalf("limits = %#v", config.Limits)
 	}
 }

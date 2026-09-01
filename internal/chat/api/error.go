@@ -7,12 +7,23 @@ import (
 	openaiapi "github.com/zhaohaip/ai-api-gateway-go/api/openai"
 	gatewayauth "github.com/zhaohaip/ai-api-gateway-go/internal/auth"
 	"github.com/zhaohaip/ai-api-gateway-go/internal/chat/domain"
+	"github.com/zhaohaip/ai-api-gateway-go/internal/concurrencylimit"
 	"github.com/zhaohaip/ai-api-gateway-go/internal/ratelimit"
 )
 
 const statusClientClosedRequest = 499
 
 func toHTTPError(err error) (int, openaiapi.ErrorResponse) {
+	var concurrencyErr *concurrencylimit.Error
+	if errors.As(err, &concurrencyErr) {
+		return http.StatusTooManyRequests, openaiapi.ErrorResponse{Error: openaiapi.ErrorDetail{
+			Message: "Concurrency limit exceeded.",
+			Type:    "rate_limit_error",
+			Param:   nil,
+			Code:    "concurrency_limit_exceeded",
+		}}
+	}
+
 	var limitErr *ratelimit.Error
 	if errors.As(err, &limitErr) {
 		return http.StatusTooManyRequests, openaiapi.ErrorResponse{Error: openaiapi.ErrorDetail{

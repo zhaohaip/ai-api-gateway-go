@@ -15,6 +15,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/zhaohaip/ai-api-gateway-go/internal/auth"
+	"github.com/zhaohaip/ai-api-gateway-go/internal/concurrencylimit"
 	"github.com/zhaohaip/ai-api-gateway-go/internal/ratelimit"
 )
 
@@ -38,10 +39,16 @@ type AuthConfig struct {
 	APIKeys []auth.APIKey
 }
 
-// LimitsConfig 表示网关的全局和默认 API Key 请求频率限制。
+// LimitsConfig 表示网关的全局和默认 API Key 请求限制。
 type LimitsConfig struct {
-	Global        ratelimit.Limit
-	DefaultAPIKey ratelimit.Limit
+	Global        RequestLimits
+	DefaultAPIKey RequestLimits
+}
+
+// RequestLimits 表示一个范围内的频率和并发限制。
+type RequestLimits struct {
+	Rate           ratelimit.Limit
+	MaxConcurrency int
 }
 
 // ProviderConfig 表示一个上游服务连接配置。
@@ -81,6 +88,7 @@ type fileLimitsConfig struct {
 type fileLimitConfig struct {
 	RequestsPerSecond float64 `yaml:"requests_per_second"`
 	Burst             int     `yaml:"burst"`
+	MaxConcurrency    int     `yaml:"max_concurrency"`
 }
 
 type fileAPIKeyConfig struct {
@@ -129,13 +137,19 @@ func parse(contents []byte, lookupEnv func(string) (string, bool)) (Config, erro
 	config := Config{
 		Address: strings.TrimSpace(loaded.Address),
 		Limits: LimitsConfig{
-			Global: ratelimit.Limit{
-				RequestsPerSecond: loaded.Limits.Global.RequestsPerSecond,
-				Burst:             loaded.Limits.Global.Burst,
+			Global: RequestLimits{
+				Rate: ratelimit.Limit{
+					RequestsPerSecond: loaded.Limits.Global.RequestsPerSecond,
+					Burst:             loaded.Limits.Global.Burst,
+				},
+				MaxConcurrency: loaded.Limits.Global.MaxConcurrency,
 			},
-			DefaultAPIKey: ratelimit.Limit{
-				RequestsPerSecond: loaded.Limits.DefaultAPIKey.RequestsPerSecond,
-				Burst:             loaded.Limits.DefaultAPIKey.Burst,
+			DefaultAPIKey: RequestLimits{
+				Rate: ratelimit.Limit{
+					RequestsPerSecond: loaded.Limits.DefaultAPIKey.RequestsPerSecond,
+					Burst:             loaded.Limits.DefaultAPIKey.Burst,
+				},
+				MaxConcurrency: loaded.Limits.DefaultAPIKey.MaxConcurrency,
 			},
 		},
 		Models: make([]ModelConfig, 0, len(loaded.Models)),
@@ -199,7 +213,13 @@ func parse(contents []byte, lookupEnv func(string) (string, bool)) (Config, erro
 }
 
 func validateLimits(limits LimitsConfig) error {
-	if _, err := ratelimit.NewMemoryLimiter(limits.Global, limits.DefaultAPIKey); err != nil {
+	if _, err := ratelimit.NewMemoryLimiter(limits.Global.Rate, limits.DefaultAPIKey.Rate); err != nil {
+		return fmt.Errorf("limits configuration is invalid: %w", err)
+	}
+	if _, err := concurrencylimit.NewMemoryController(
+		limits.Global.MaxConcurrency,
+		limits.DefaultAPIKey.MaxConcurrency,
+	); err != nil {
 		return fmt.Errorf("limits configuration is invalid: %w", err)
 	}
 	return nil

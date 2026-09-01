@@ -117,7 +117,7 @@ func TestAppRejectsInvalidRequestLimitConfiguration(t *testing.T) {
 			{ID: "client", KeyHash: sha256.Sum256([]byte("client")), Enabled: true},
 		}},
 		Limits: config.LimitsConfig{
-			Global: ratelimit.Limit{RequestsPerSecond: 1, Burst: 0},
+			Global: config.RequestLimits{Rate: ratelimit.Limit{RequestsPerSecond: 1, Burst: 0}},
 		},
 		Providers: []config.ProviderConfig{
 			{Name: "provider", Type: config.ProviderTypeOpenAICompatible},
@@ -129,6 +129,23 @@ func TestAppRejectsInvalidRequestLimitConfiguration(t *testing.T) {
 		return &appFakeProvider{}, nil
 	})
 	if err == nil || !strings.Contains(err.Error(), "request limiter") {
+		t.Fatalf("newApp() error = %v", err)
+	}
+}
+
+func TestAppRejectsInvalidConcurrencyLimitConfiguration(t *testing.T) {
+	_, err := newApp(context.Background(), config.Config{
+		Auth: config.AuthConfig{APIKeys: []gatewayauth.APIKey{
+			{ID: "client", KeyHash: sha256.Sum256([]byte("client")), Enabled: true},
+		}},
+		Limits: config.LimitsConfig{
+			Global: config.RequestLimits{MaxConcurrency: -1},
+		},
+	}, func(context.Context, config.ProviderConfig, string) (service.ChatProvider, error) {
+		t.Fatal("invalid concurrency configuration initialized provider")
+		return nil, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "concurrency controller") {
 		t.Fatalf("newApp() error = %v", err)
 	}
 }

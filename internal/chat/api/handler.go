@@ -16,6 +16,7 @@ import (
 	gatewayauth "github.com/zhaohaip/ai-api-gateway-go/internal/auth"
 	"github.com/zhaohaip/ai-api-gateway-go/internal/chat/domain"
 	"github.com/zhaohaip/ai-api-gateway-go/internal/chat/service"
+	"github.com/zhaohaip/ai-api-gateway-go/internal/concurrencylimit"
 	"github.com/zhaohaip/ai-api-gateway-go/internal/ratelimit"
 )
 
@@ -24,6 +25,7 @@ type Handler struct {
 	chatService *service.ChatService
 	authorizer  gatewayauth.ModelAuthorizer
 	limiter     ratelimit.Limiter
+	concurrency concurrencylimit.Controller
 	newID       func() (string, error)
 	now         func() time.Time
 	logger      *slog.Logger
@@ -31,15 +33,25 @@ type Handler struct {
 
 // NewHandler 创建聊天 HTTP Handler。
 func NewHandler(chatService *service.ChatService) *Handler {
-	return NewHandlerWithLimiter(chatService, unlimitedLimiter{})
+	return NewHandlerWithRequestControls(chatService, unlimitedLimiter{}, unlimitedConcurrencyController{})
 }
 
 // NewHandlerWithLimiter 创建使用指定请求频率限制器的聊天 HTTP Handler。
 func NewHandlerWithLimiter(chatService *service.ChatService, limiter ratelimit.Limiter) *Handler {
+	return NewHandlerWithRequestControls(chatService, limiter, unlimitedConcurrencyController{})
+}
+
+// NewHandlerWithRequestControls 创建使用指定频率和并发控制器的聊天 HTTP Handler。
+func NewHandlerWithRequestControls(
+	chatService *service.ChatService,
+	limiter ratelimit.Limiter,
+	concurrencyController concurrencylimit.Controller,
+) *Handler {
 	return &Handler{
 		chatService: chatService,
 		authorizer:  gatewayauth.ModelAuthorizer{},
 		limiter:     limiter,
+		concurrency: concurrencyController,
 		newID:       newCompletionID,
 		now:         time.Now,
 		logger:      slog.Default(),
@@ -78,12 +90,17 @@ func (h *Handler) CreateChatCompletion(c *gin.Context) {
 	if !h.allowRequest(c, principal, request.Model) {
 		return
 	}
+	lease, ok := h.acquireConcurrency(c, principal, request.Model, request.Stream)
+	if !ok {
+		return
+	}
 
 	domainRequest := toDomainRequest(request)
 	if request.Stream {
-		h.streamChatCompletion(c, request.Model, domainRequest)
+		h.streamChatCompletion(c, request.Model, domainRequest, lease)
 		return
 	}
+	defer lease.Release()
 	h.generateChatCompletion(c, request.Model, domainRequest)
 }
 
@@ -104,6 +121,11 @@ func (h *Handler) ListModels(c *gin.Context) {
 	if !h.allowRequest(c, principal, "") {
 		return
 	}
+	lease, ok := h.acquireConcurrency(c, principal, "", false)
+	if !ok {
+		return
+	}
+	defer lease.Release()
 	c.JSON(http.StatusOK, toOpenAIModelList(allowedModels, h.now().Unix()))
 }
 
@@ -124,6 +146,31 @@ func (h *Handler) allowRequest(c *gin.Context, principal gatewayauth.Principal, 
 	}
 	h.writeError(c, err)
 	return false
+}
+
+func (h *Handler) acquireConcurrency(
+	c *gin.Context,
+	principal gatewayauth.Principal,
+	model string,
+	stream bool,
+) (concurrencylimit.Lease, bool) {
+	lease, err := h.concurrency.Acquire(principal.KeyID)
+	if err == nil {
+		return lease, true
+	}
+	var concurrencyErr *concurrencylimit.Error
+	if errors.As(err, &concurrencyErr) {
+		h.logger.Warn(
+			"请求超过并发限制",
+			"request_id", requestID(c),
+			"key_id", principal.KeyID,
+			"model", model,
+			"stream", stream,
+			"limit_scope", concurrencyErr.Scope,
+		)
+	}
+	h.writeError(c, err)
+	return nil, false
 }
 
 func (h *Handler) generateChatCompletion(c *gin.Context, requestedModel string, request domain.ChatRequest) {
@@ -173,3 +220,13 @@ type unlimitedLimiter struct{}
 func (unlimitedLimiter) Allow(string) error {
 	return nil
 }
+
+type unlimitedConcurrencyController struct{}
+
+func (unlimitedConcurrencyController) Acquire(string) (concurrencylimit.Lease, error) {
+	return unlimitedConcurrencyLease{}, nil
+}
+
+type unlimitedConcurrencyLease struct{}
+
+func (unlimitedConcurrencyLease) Release() {}

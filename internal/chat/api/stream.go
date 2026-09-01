@@ -10,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/zhaohaip/ai-api-gateway-go/internal/chat/domain"
+	"github.com/zhaohaip/ai-api-gateway-go/internal/concurrencylimit"
 )
 
 const doneEvent = "[DONE]"
@@ -18,7 +19,13 @@ type responseWriterUnwrapper interface {
 	Unwrap() http.ResponseWriter
 }
 
-func (h *Handler) streamChatCompletion(c *gin.Context, requestedModel string, request domain.ChatRequest) {
+func (h *Handler) streamChatCompletion(
+	c *gin.Context,
+	requestedModel string,
+	request domain.ChatRequest,
+	lease concurrencylimit.Lease,
+) {
+	defer lease.Release()
 	flusher, ok := sseFlusher(c.Writer)
 	if !ok {
 		h.writeError(c, domain.NewInternalError(errors.New("response writer does not support flushing")))
@@ -36,6 +43,7 @@ func (h *Handler) streamChatCompletion(c *gin.Context, requestedModel string, re
 		h.writeError(c, err)
 		return
 	}
+	stream = newConcurrencyChatStream(stream, lease)
 	defer h.closeStream(stream, id)
 
 	sent, finished := false, false

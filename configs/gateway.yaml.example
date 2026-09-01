@@ -19,10 +19,12 @@ limits:
   global:
     requests_per_second: 100
     burst: 200
+    max_concurrency: 50
 
   default_api_key:
     requests_per_second: 5
     burst: 10
+    max_concurrency: 3
 
 providers:
   - name: deepseek

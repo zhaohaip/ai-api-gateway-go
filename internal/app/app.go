@@ -14,6 +14,7 @@ import (
 	chateino "github.com/zhaohaip/ai-api-gateway-go/internal/chat/adapter/eino"
 	chatapi "github.com/zhaohaip/ai-api-gateway-go/internal/chat/api"
 	"github.com/zhaohaip/ai-api-gateway-go/internal/chat/service"
+	"github.com/zhaohaip/ai-api-gateway-go/internal/concurrencylimit"
 	"github.com/zhaohaip/ai-api-gateway-go/internal/config"
 	"github.com/zhaohaip/ai-api-gateway-go/internal/ratelimit"
 )
@@ -37,16 +38,23 @@ func newApp(ctx context.Context, appConfig config.Config, factory providerFactor
 	if err != nil {
 		return nil, fmt.Errorf("initialize API key authenticator: %w", err)
 	}
-	limiter, err := ratelimit.NewMemoryLimiter(appConfig.Limits.Global, appConfig.Limits.DefaultAPIKey)
+	limiter, err := ratelimit.NewMemoryLimiter(appConfig.Limits.Global.Rate, appConfig.Limits.DefaultAPIKey.Rate)
 	if err != nil {
 		return nil, fmt.Errorf("initialize request limiter: %w", err)
+	}
+	concurrencyController, err := concurrencylimit.NewMemoryController(
+		appConfig.Limits.Global.MaxConcurrency,
+		appConfig.Limits.DefaultAPIKey.MaxConcurrency,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("initialize concurrency controller: %w", err)
 	}
 	registry, err := buildModelRegistry(ctx, appConfig, factory)
 	if err != nil {
 		return nil, err
 	}
 	chatService := service.NewChatService(registry)
-	handler := chatapi.NewHandlerWithLimiter(chatService, limiter)
+	handler := chatapi.NewHandlerWithRequestControls(chatService, limiter, concurrencyController)
 
 	return &App{
 		server: &http.Server{
