@@ -4,9 +4,11 @@ package api
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"log/slog"
 	"mime"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -14,12 +16,14 @@ import (
 	gatewayauth "github.com/zhaohaip/ai-api-gateway-go/internal/auth"
 	"github.com/zhaohaip/ai-api-gateway-go/internal/chat/domain"
 	"github.com/zhaohaip/ai-api-gateway-go/internal/chat/service"
+	"github.com/zhaohaip/ai-api-gateway-go/internal/ratelimit"
 )
 
 // Handler 处理 OpenAI 兼容聊天请求。
 type Handler struct {
 	chatService *service.ChatService
 	authorizer  gatewayauth.ModelAuthorizer
+	limiter     ratelimit.Limiter
 	newID       func() (string, error)
 	now         func() time.Time
 	logger      *slog.Logger
@@ -27,9 +31,15 @@ type Handler struct {
 
 // NewHandler 创建聊天 HTTP Handler。
 func NewHandler(chatService *service.ChatService) *Handler {
+	return NewHandlerWithLimiter(chatService, unlimitedLimiter{})
+}
+
+// NewHandlerWithLimiter 创建使用指定请求频率限制器的聊天 HTTP Handler。
+func NewHandlerWithLimiter(chatService *service.ChatService, limiter ratelimit.Limiter) *Handler {
 	return &Handler{
 		chatService: chatService,
 		authorizer:  gatewayauth.ModelAuthorizer{},
+		limiter:     limiter,
 		newID:       newCompletionID,
 		now:         time.Now,
 		logger:      slog.Default(),
@@ -65,6 +75,9 @@ func (h *Handler) CreateChatCompletion(c *gin.Context) {
 		h.writeError(c, err)
 		return
 	}
+	if !h.allowRequest(c, principal, request.Model) {
+		return
+	}
 
 	domainRequest := toDomainRequest(request)
 	if request.Stream {
@@ -88,7 +101,29 @@ func (h *Handler) ListModels(c *gin.Context) {
 			allowedModels = append(allowedModels, model)
 		}
 	}
+	if !h.allowRequest(c, principal, "") {
+		return
+	}
 	c.JSON(http.StatusOK, toOpenAIModelList(allowedModels, h.now().Unix()))
+}
+
+func (h *Handler) allowRequest(c *gin.Context, principal gatewayauth.Principal, model string) bool {
+	err := h.limiter.Allow(principal.KeyID)
+	if err == nil {
+		return true
+	}
+	var limitErr *ratelimit.Error
+	if errors.As(err, &limitErr) {
+		h.logger.Warn(
+			"请求超过频率限制",
+			"request_id", requestID(c),
+			"key_id", principal.KeyID,
+			"model", model,
+			"limit_scope", limitErr.Scope,
+		)
+	}
+	h.writeError(c, err)
+	return false
 }
 
 func (h *Handler) generateChatCompletion(c *gin.Context, requestedModel string, request domain.ChatRequest) {
@@ -120,4 +155,21 @@ func newCompletionID() (string, error) {
 		return "", err
 	}
 	return "chatcmpl-" + hex.EncodeToString(bytes), nil
+}
+
+func requestID(c *gin.Context) string {
+	if value := strings.TrimSpace(c.GetHeader("X-Request-ID")); value != "" {
+		return value
+	}
+	id, err := newCompletionID()
+	if err != nil {
+		return "unavailable"
+	}
+	return "req-" + strings.TrimPrefix(id, "chatcmpl-")
+}
+
+type unlimitedLimiter struct{}
+
+func (unlimitedLimiter) Allow(string) error {
+	return nil
 }

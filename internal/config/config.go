@@ -15,6 +15,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/zhaohaip/ai-api-gateway-go/internal/auth"
+	"github.com/zhaohaip/ai-api-gateway-go/internal/ratelimit"
 )
 
 const (
@@ -27,6 +28,7 @@ const (
 type Config struct {
 	Address   string
 	Auth      AuthConfig
+	Limits    LimitsConfig
 	Providers []ProviderConfig
 	Models    []ModelConfig
 }
@@ -34,6 +36,12 @@ type Config struct {
 // AuthConfig 表示客户端访问网关所需的认证配置。
 type AuthConfig struct {
 	APIKeys []auth.APIKey
+}
+
+// LimitsConfig 表示网关的全局和默认 API Key 请求频率限制。
+type LimitsConfig struct {
+	Global        ratelimit.Limit
+	DefaultAPIKey ratelimit.Limit
 }
 
 // ProviderConfig 表示一个上游服务连接配置。
@@ -56,12 +64,23 @@ type ModelConfig struct {
 type fileConfig struct {
 	Address   string               `yaml:"address"`
 	Auth      fileAuthConfig       `yaml:"auth"`
+	Limits    fileLimitsConfig     `yaml:"limits"`
 	Providers []fileProviderConfig `yaml:"providers"`
 	Models    []ModelConfig        `yaml:"models"`
 }
 
 type fileAuthConfig struct {
 	APIKeys []fileAPIKeyConfig `yaml:"api_keys"`
+}
+
+type fileLimitsConfig struct {
+	Global        fileLimitConfig `yaml:"global"`
+	DefaultAPIKey fileLimitConfig `yaml:"default_api_key"`
+}
+
+type fileLimitConfig struct {
+	RequestsPerSecond float64 `yaml:"requests_per_second"`
+	Burst             int     `yaml:"burst"`
 }
 
 type fileAPIKeyConfig struct {
@@ -109,13 +128,26 @@ func parse(contents []byte, lookupEnv func(string) (string, bool)) (Config, erro
 
 	config := Config{
 		Address: strings.TrimSpace(loaded.Address),
-		Models:  make([]ModelConfig, 0, len(loaded.Models)),
+		Limits: LimitsConfig{
+			Global: ratelimit.Limit{
+				RequestsPerSecond: loaded.Limits.Global.RequestsPerSecond,
+				Burst:             loaded.Limits.Global.Burst,
+			},
+			DefaultAPIKey: ratelimit.Limit{
+				RequestsPerSecond: loaded.Limits.DefaultAPIKey.RequestsPerSecond,
+				Burst:             loaded.Limits.DefaultAPIKey.Burst,
+			},
+		},
+		Models: make([]ModelConfig, 0, len(loaded.Models)),
 	}
 	if config.Address == "" {
 		config.Address = defaultAddress
 	}
 	if address, exists := lookupEnv("AI_GATEWAY_ADDR"); exists && strings.TrimSpace(address) != "" {
 		config.Address = strings.TrimSpace(address)
+	}
+	if err := validateLimits(config.Limits); err != nil {
+		return Config{}, err
 	}
 
 	config.Providers = make([]ProviderConfig, 0, len(loaded.Providers))
@@ -164,6 +196,13 @@ func parse(contents []byte, lookupEnv func(string) (string, bool)) (Config, erro
 	}
 	config.Auth.APIKeys = apiKeys
 	return config, nil
+}
+
+func validateLimits(limits LimitsConfig) error {
+	if _, err := ratelimit.NewMemoryLimiter(limits.Global, limits.DefaultAPIKey); err != nil {
+		return fmt.Errorf("limits configuration is invalid: %w", err)
+	}
+	return nil
 }
 
 func validateClientAPIKeys(

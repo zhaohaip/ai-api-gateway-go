@@ -15,6 +15,15 @@ auth:
       allowed_models:
         - "*"
 
+limits:
+  global:
+    requests_per_second: 100
+    burst: 200
+
+  default_api_key:
+    requests_per_second: 5
+    burst: 10
+
 providers:
   - name: deepseek
     type: openai-compatible

@@ -1,12 +1,16 @@
 package api
 
 import (
+	"errors"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 
 	gatewayauth "github.com/zhaohaip/ai-api-gateway-go/internal/auth"
+	"github.com/zhaohaip/ai-api-gateway-go/internal/ratelimit"
 )
 
 func apiKeyAuthentication(authenticator gatewayauth.APIKeyAuthenticator) gin.HandlerFunc {
@@ -44,6 +48,11 @@ func writeHTTPError(c *gin.Context, err error) {
 	status, response := toHTTPError(err)
 	if status == http.StatusUnauthorized {
 		c.Header("WWW-Authenticate", "Bearer")
+	}
+	var limitErr *ratelimit.Error
+	if errors.As(err, &limitErr) && limitErr.RetryAfter > 0 {
+		seconds := int64(math.Ceil(limitErr.RetryAfter.Seconds()))
+		c.Header("Retry-After", strconv.FormatInt(max(seconds, 1), 10))
 	}
 	c.AbortWithStatusJSON(status, response)
 }

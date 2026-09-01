@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/zhaohaip/ai-api-gateway-go/internal/ratelimit"
 )
 
 const validConfigYAML = `
@@ -21,6 +23,13 @@ auth:
       key_env: GATEWAY_INTERNAL_API_KEY
       enabled: true
       allowed_models: ["*"]
+limits:
+  global:
+    requests_per_second: 100
+    burst: 200
+  default_api_key:
+    requests_per_second: 5
+    burst: 10
 providers:
   - name: deepseek
     type: openai-compatible
@@ -70,6 +79,82 @@ func TestLoadMultipleProvidersAndModels(t *testing.T) {
 	}
 	if len(config.Auth.APIKeys) != 2 || config.Auth.APIKeys[0].KeyHash != sha256.Sum256([]byte("sk-gw-demo")) {
 		t.Fatalf("client API keys = %#v", config.Auth.APIKeys)
+	}
+	if config.Limits.Global.RequestsPerSecond != 100 || config.Limits.Global.Burst != 200 ||
+		config.Limits.DefaultAPIKey.RequestsPerSecond != 5 || config.Limits.DefaultAPIKey.Burst != 10 {
+		t.Fatalf("limits = %#v", config.Limits)
+	}
+}
+
+func TestParseValidatesRequestLimits(t *testing.T) {
+	baseConfig := `auth:
+  api_keys:
+    - {id: client, key_env: CLIENT_KEY, enabled: true, allowed_models: [chat]}
+` + singleProviderYAML() + validSingleModelYAML()
+	tests := []struct {
+		name    string
+		limits  string
+		wantErr string
+	}{
+		{
+			name: "negative global rate",
+			limits: `limits:
+  global: {requests_per_second: -1, burst: 1}
+`,
+			wantErr: "global requests_per_second",
+		},
+		{
+			name: "negative API key burst",
+			limits: `limits:
+  default_api_key: {requests_per_second: 1, burst: -1}
+`,
+			wantErr: "default_api_key burst",
+		},
+		{
+			name: "rate without burst",
+			limits: `limits:
+  global: {requests_per_second: 1, burst: 0}
+`,
+			wantErr: "must both be zero or greater than zero",
+		},
+		{
+			name: "burst without rate",
+			limits: `limits:
+  default_api_key: {requests_per_second: 0, burst: 1}
+`,
+			wantErr: "must both be zero or greater than zero",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := parse([]byte(test.limits+baseConfig), mapLookup(map[string]string{
+				"KEY":        "provider",
+				"CLIENT_KEY": "client",
+			}))
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("parse() error = %v, want containing %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestParseTreatsZeroRequestLimitsAsDisabled(t *testing.T) {
+	contents := `limits:
+  global: {requests_per_second: 0, burst: 0}
+  default_api_key: {requests_per_second: 0, burst: 0}
+auth:
+  api_keys:
+    - {id: client, key_env: CLIENT_KEY, enabled: true, allowed_models: [chat]}
+` + singleProviderYAML() + validSingleModelYAML()
+	config, err := parse([]byte(contents), mapLookup(map[string]string{
+		"KEY":        "provider",
+		"CLIENT_KEY": "client",
+	}))
+	if err != nil {
+		t.Fatalf("parse() error = %v", err)
+	}
+	if config.Limits.Global != (ratelimit.Limit{}) || config.Limits.DefaultAPIKey != (ratelimit.Limit{}) {
+		t.Fatalf("limits = %#v", config.Limits)
 	}
 }
 

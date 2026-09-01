@@ -7,11 +7,22 @@ import (
 	openaiapi "github.com/zhaohaip/ai-api-gateway-go/api/openai"
 	gatewayauth "github.com/zhaohaip/ai-api-gateway-go/internal/auth"
 	"github.com/zhaohaip/ai-api-gateway-go/internal/chat/domain"
+	"github.com/zhaohaip/ai-api-gateway-go/internal/ratelimit"
 )
 
 const statusClientClosedRequest = 499
 
 func toHTTPError(err error) (int, openaiapi.ErrorResponse) {
+	var limitErr *ratelimit.Error
+	if errors.As(err, &limitErr) {
+		return http.StatusTooManyRequests, openaiapi.ErrorResponse{Error: openaiapi.ErrorDetail{
+			Message: "Rate limit exceeded.",
+			Type:    "rate_limit_error",
+			Param:   nil,
+			Code:    "rate_limit_exceeded",
+		}}
+	}
+
 	var authErr *gatewayauth.Error
 	if errors.As(err, &authErr) {
 		if authErr.Kind == gatewayauth.ErrorKindPermission {

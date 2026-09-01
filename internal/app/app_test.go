@@ -16,6 +16,7 @@ import (
 	"github.com/zhaohaip/ai-api-gateway-go/internal/chat/domain"
 	"github.com/zhaohaip/ai-api-gateway-go/internal/chat/service"
 	"github.com/zhaohaip/ai-api-gateway-go/internal/config"
+	"github.com/zhaohaip/ai-api-gateway-go/internal/ratelimit"
 )
 
 type appFakeProvider struct {
@@ -107,6 +108,28 @@ func TestBuildModelRegistryFailsWhenProviderInitializationFails(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "provider") {
 		t.Fatalf("buildModelRegistry() error = %v", err)
+	}
+}
+
+func TestAppRejectsInvalidRequestLimitConfiguration(t *testing.T) {
+	_, err := newApp(context.Background(), config.Config{
+		Auth: config.AuthConfig{APIKeys: []gatewayauth.APIKey{
+			{ID: "client", KeyHash: sha256.Sum256([]byte("client")), Enabled: true},
+		}},
+		Limits: config.LimitsConfig{
+			Global: ratelimit.Limit{RequestsPerSecond: 1, Burst: 0},
+		},
+		Providers: []config.ProviderConfig{
+			{Name: "provider", Type: config.ProviderTypeOpenAICompatible},
+		},
+		Models: []config.ModelConfig{
+			{Name: "chat", Provider: "provider", UpstreamModel: "upstream"},
+		},
+	}, func(context.Context, config.ProviderConfig, string) (service.ChatProvider, error) {
+		return &appFakeProvider{}, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "request limiter") {
+		t.Fatalf("newApp() error = %v", err)
 	}
 }
 

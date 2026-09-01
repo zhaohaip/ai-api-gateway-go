@@ -15,6 +15,7 @@ import (
 	chatapi "github.com/zhaohaip/ai-api-gateway-go/internal/chat/api"
 	"github.com/zhaohaip/ai-api-gateway-go/internal/chat/service"
 	"github.com/zhaohaip/ai-api-gateway-go/internal/config"
+	"github.com/zhaohaip/ai-api-gateway-go/internal/ratelimit"
 )
 
 const shutdownTimeout = 10 * time.Second
@@ -36,12 +37,16 @@ func newApp(ctx context.Context, appConfig config.Config, factory providerFactor
 	if err != nil {
 		return nil, fmt.Errorf("initialize API key authenticator: %w", err)
 	}
+	limiter, err := ratelimit.NewMemoryLimiter(appConfig.Limits.Global, appConfig.Limits.DefaultAPIKey)
+	if err != nil {
+		return nil, fmt.Errorf("initialize request limiter: %w", err)
+	}
 	registry, err := buildModelRegistry(ctx, appConfig, factory)
 	if err != nil {
 		return nil, err
 	}
 	chatService := service.NewChatService(registry)
-	handler := chatapi.NewHandler(chatService)
+	handler := chatapi.NewHandlerWithLimiter(chatService, limiter)
 
 	return &App{
 		server: &http.Server{
