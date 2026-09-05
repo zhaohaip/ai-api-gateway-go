@@ -40,6 +40,8 @@ Provider 使用 `connect_timeout`、`tls_handshake_timeout` 和 `response_header
 
 流式调用只有在收到结束原因并正常读到 EOF 后才发送 `data: [DONE]`。首个 Chunk 前的错误仍返回 OpenAI JSON 错误；已经输出部分 Chunk 后发生错误或取消时，连接直接结束，不追加 JSON 错误或伪造 `[DONE]`。
 
+SSE 正常完成、网关超时、客户端取消和 Stream 错误通过同一个互斥终态决策竞争。正常完成胜出后停止全部业务计时器，再写出一次 `[DONE]`；异常终态胜出时不发送 `[DONE]`。终态与 Provider Context 的 Cause 一并固定，迟到的回调和取消不能覆盖结果。完成决策后的网络写失败只记录交付失败，不回退终态或重试结束标记。
+
 ```bash
 curl -N http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer ${GATEWAY_DEMO_API_KEY}" \

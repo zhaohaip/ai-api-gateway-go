@@ -27,7 +27,7 @@ func newControlledTimerFactory() *controlledTimerFactory {
 }
 
 func (f *controlledTimerFactory) New(duration time.Duration, callback func()) timeoutTimer {
-	timer := &controlledTimer{duration: duration, callback: callback, active: true}
+	timer := &controlledTimer{duration: duration, remaining: duration, callback: callback, active: true}
 	f.mu.Lock()
 	f.timers = append(f.timers, timer)
 	f.mu.Unlock()
@@ -61,6 +61,7 @@ func (f *controlledTimerFactory) Wait(t *testing.T, index int) *controlledTimer 
 type controlledTimer struct {
 	mu         sync.Mutex
 	duration   time.Duration
+	remaining  time.Duration
 	callback   func()
 	active     bool
 	resetCount int
@@ -79,6 +80,7 @@ func (t *controlledTimer) Reset(duration time.Duration) bool {
 	defer t.mu.Unlock()
 	wasActive := t.active
 	t.duration = duration
+	t.remaining = duration
 	t.active = true
 	t.resetCount++
 	return wasActive

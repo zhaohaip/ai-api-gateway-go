@@ -1,7 +1,6 @@
 package api
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -42,81 +41,101 @@ func (h *Handler) streamChatCompletion(
 	created := h.now().Unix()
 
 	timeoutState := newStreamTimeoutState(c.Request.Context(), h.timeouts.Stream, h.newTimer)
-	stream, err := h.chatService.Stream(timeoutState.Context(), request)
-	if timeout := timeoutFromContext(timeoutState.Context()); timeout != nil {
+	var stream domain.ChatStream
+	defer func() {
+		timeoutState.Close()
 		if stream != nil {
 			h.closeStream(stream, id)
 		}
-		timeoutState.Close()
-		h.handleStreamTimeout(c, principal.KeyID, requestedModel, false, timeout)
-		return
+	}()
+	stream, err = h.chatService.Stream(timeoutState.Context(), request)
+	if stream != nil {
+		stream = newConcurrencyChatStream(stream, lease)
 	}
 	if err != nil {
-		timeoutState.Close()
-		h.writeError(c, err)
+		timeoutState.decide(streamFailed, err)
+	}
+	if h.handleStreamTerminal(c, timeoutState, principal.KeyID, requestedModel, id, false, "create") {
 		return
 	}
-	stream = newConcurrencyChatStream(stream, lease)
-	defer func() {
-		timeoutState.Close()
-		h.closeStream(stream, id)
-	}()
 
 	sent, finished := false, false
 	for {
 		chunk, recvErr := stream.Recv()
-		if timeout := timeoutFromContext(timeoutState.Context()); timeout != nil {
-			h.handleStreamTimeout(c, principal.KeyID, requestedModel, sent, timeout)
-			return
-		}
-		if timeoutState.Context().Err() != nil {
-			h.logStreamError(
-				id,
-				"canceled",
-				canceledRequestError(context.Cause(timeoutState.Context())),
-			)
-			return
-		}
 		if errors.Is(recvErr, io.EOF) {
-			h.finishStream(c, flusher, id, sent, finished)
+			switch {
+			case !sent:
+				timeoutState.decide(streamFailed, upstreamStreamError("the upstream service returned an empty stream"))
+			case !finished:
+				timeoutState.decide(streamFailed, upstreamStreamError("the upstream stream ended without a finish reason"))
+			default:
+				if timeoutState.decide(streamCompleted, nil) {
+					// 完成胜出后，迟到的取消或超时不能改变结果；网络写失败仅记录交付失败。
+					if err := writeSSEEvent(c.Writer, flusher, []byte(doneEvent)); err != nil {
+						h.logStreamError(id, "write_done", domain.NewInternalError(err))
+					}
+					return
+				}
+			}
+			h.handleStreamTerminal(c, timeoutState, principal.KeyID, requestedModel, id, sent, "eof")
 			return
 		}
 		if recvErr != nil {
-			h.handleStreamError(c, id, sent, "receive", recvErr)
+			timeoutState.decide(streamFailed, recvErr)
+		}
+		if h.handleStreamTerminal(c, timeoutState, principal.KeyID, requestedModel, id, sent, "receive") {
 			return
 		}
-		if chunk.Empty() {
-			continue
-		}
-		if !hasOpenAIChunkData(chunk, !sent) {
+		if chunk.Empty() || !hasOpenAIChunkData(chunk, !sent) {
 			continue
 		}
 		if finished {
-			h.logStreamError(id, "protocol", upstreamStreamError("the upstream stream returned data after finishing"))
+			timeoutState.decide(streamFailed, upstreamStreamError("the upstream stream returned data after finishing"))
+			h.handleStreamTerminal(c, timeoutState, principal.KeyID, requestedModel, id, sent, "protocol")
 			return
 		}
 		timeoutState.FirstChunkReceived()
-
 		payload, marshalErr := json.Marshal(toOpenAIChunk(id, created, requestedModel, chunk, !sent))
 		if marshalErr != nil {
-			h.handleStreamError(c, id, sent, "marshal", domain.NewInternalError(marshalErr))
-			return
+			timeoutState.decide(streamFailed, domain.NewInternalError(marshalErr))
 		}
-		if timeout := timeoutFromContext(timeoutState.Context()); timeout != nil {
-			h.handleStreamTimeout(c, principal.KeyID, requestedModel, sent, timeout)
+		if h.handleStreamTerminal(c, timeoutState, principal.KeyID, requestedModel, id, sent, "marshal") {
 			return
 		}
 		if !sent {
 			setSSEHeaders(c.Writer.Header())
 		}
 		if writeErr := writeSSEEvent(c.Writer, flusher, payload); writeErr != nil {
-			h.logStreamError(id, "write", domain.NewInternalError(writeErr))
+			timeoutState.decide(streamFailed, domain.NewInternalError(writeErr))
+			// 写出可能部分成功，不再尝试追加 JSON。
+			h.handleStreamTerminal(c, timeoutState, principal.KeyID, requestedModel, id, true, "write")
 			return
 		}
 		sent = true
 		timeoutState.OutputSent()
 		finished = chunk.FinishReason != nil
 	}
+}
+
+func (h *Handler) handleStreamTerminal(
+	c *gin.Context, state *streamTimeoutState, keyID, model, id string, sent bool, stage string,
+) bool {
+	terminal, cause := state.result()
+	switch terminal {
+	case streamActive:
+		return false
+	case streamTimedOut:
+		h.handleStreamTimeout(c, keyID, model, sent, timeoutFromContext(state.Context()))
+	case streamCanceled:
+		if stage == "create" {
+			h.handleStreamError(c, id, sent, "canceled", canceledRequestError(cause))
+		} else {
+			h.logStreamError(id, "canceled", canceledRequestError(cause))
+		}
+	case streamFailed:
+		h.handleStreamError(c, id, sent, stage, cause)
+	}
+	return true
 }
 
 func (h *Handler) handleStreamTimeout(
@@ -132,20 +151,6 @@ func (h *Handler) handleStreamTimeout(
 		return
 	}
 	// SSE 已提交后只能终止连接，不能追加普通 JSON 错误或伪造 [DONE]。
-}
-
-func (h *Handler) finishStream(c *gin.Context, flusher http.Flusher, id string, sent, finished bool) {
-	if !sent {
-		h.writeError(c, upstreamStreamError("the upstream service returned an empty stream"))
-		return
-	}
-	if !finished {
-		h.logStreamError(id, "eof", upstreamStreamError("the upstream stream ended without a finish reason"))
-		return
-	}
-	if err := writeSSEEvent(c.Writer, flusher, []byte(doneEvent)); err != nil {
-		h.logStreamError(id, "write_done", domain.NewInternalError(err))
-	}
 }
 
 func (h *Handler) handleStreamError(c *gin.Context, id string, sent bool, stage string, err error) {

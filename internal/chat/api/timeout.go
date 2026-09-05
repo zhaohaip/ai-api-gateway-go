@@ -77,16 +77,29 @@ func newCallTimeoutContext(
 	}
 }
 
+type streamTerminal uint8
+
+const (
+	streamActive streamTerminal = iota
+	streamCompleted
+	streamTimedOut
+	streamCanceled
+	streamFailed
+)
+
 type streamTimeoutState struct {
-	ctx        context.Context
-	cancel     context.CancelCauseFunc
-	newTimer   timeoutTimerFactory
-	first      time.Duration
-	idle       time.Duration
-	firstTimer timeoutTimer
-	idleTimer  timeoutTimer
-	totalTimer timeoutTimer
-	closeOnce  sync.Once
+	ctx         context.Context
+	cancel      context.CancelCauseFunc
+	newTimer    timeoutTimerFactory
+	idle        time.Duration
+	mu          sync.Mutex
+	terminal    streamTerminal
+	parentCause func() error
+	stopParent  func() bool
+	parentDone  chan struct{}
+	firstTimer  timeoutTimer
+	idleTimer   timeoutTimer
+	totalTimer  timeoutTimer
 }
 
 func newStreamTimeoutState(
@@ -94,35 +107,53 @@ func newStreamTimeoutState(
 	timeouts StreamTimeouts,
 	newTimer timeoutTimerFactory,
 ) *streamTimeoutState {
-	ctx, cancel := context.WithCancelCause(parent)
+	// 保留请求值，但取消只由终态决策发布，避免父 Context 绕过互斥锁。
+	ctx, cancel := context.WithCancelCause(context.WithoutCancel(parent))
 	state := &streamTimeoutState{
-		ctx:      ctx,
-		cancel:   cancel,
-		newTimer: newTimer,
-		first:    timeouts.FirstChunk,
-		idle:     timeouts.Idle,
+		ctx:         ctx,
+		cancel:      cancel,
+		newTimer:    newTimer,
+		idle:        timeouts.Idle,
+		parentCause: func() error { return context.Cause(parent) },
+		parentDone:  make(chan struct{}),
 	}
+	// 回调可能立即运行；初始化和终态切换使用同一把锁。
+	state.mu.Lock()
+	state.stopParent = context.AfterFunc(parent, func() {
+		defer close(state.parentDone)
+		state.decide(streamCanceled, context.Cause(parent))
+	})
 	if timeouts.Total > 0 {
 		state.totalTimer = newTimer(timeouts.Total, func() {
-			cancel(&gatewayTimeout{typeName: timeoutTypeStreamTotal, duration: timeouts.Total})
+			state.expire(timeoutTypeStreamTotal, timeouts.Total)
 		})
 	}
 	if timeouts.FirstChunk > 0 {
 		state.firstTimer = newTimer(timeouts.FirstChunk, func() {
-			cancel(&gatewayTimeout{
-				typeName: timeoutTypeStreamFirstChunk,
-				duration: timeouts.FirstChunk,
-			})
+			state.expire(timeoutTypeStreamFirstChunk, timeouts.FirstChunk)
 		})
 	}
+	state.observeParentLocked()
+	state.mu.Unlock()
 	return state
 }
 
-func (s *streamTimeoutState) Context() context.Context {
-	return s.ctx
+func (s *streamTimeoutState) Context() context.Context { return s.ctx }
+
+func (s *streamTimeoutState) expire(kind timeoutType, duration time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// 首包已处理时，Stop 前已经调度的回调也不能再取消请求。
+	if kind == timeoutTypeStreamFirstChunk && s.firstTimer == nil {
+		return
+	}
+	s.observeParentLocked()
+	s.decideLocked(streamTimedOut, &gatewayTimeout{typeName: kind, duration: duration})
 }
 
 func (s *streamTimeoutState) FirstChunkReceived() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.firstTimer != nil {
 		s.firstTimer.Stop()
 		s.firstTimer = nil
@@ -130,31 +161,63 @@ func (s *streamTimeoutState) FirstChunkReceived() {
 }
 
 func (s *streamTimeoutState) OutputSent() {
-	if s.idle <= 0 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.terminal != streamActive || s.idle <= 0 {
 		return
 	}
 	if s.idleTimer == nil {
-		s.idleTimer = s.newTimer(s.idle, func() {
-			s.cancel(&gatewayTimeout{typeName: timeoutTypeStreamIdle, duration: s.idle})
-		})
+		s.idleTimer = s.newTimer(s.idle, func() { s.expire(timeoutTypeStreamIdle, s.idle) })
 		return
 	}
 	s.idleTimer.Reset(s.idle)
 }
 
+func (s *streamTimeoutState) decide(terminal streamTerminal, cause error) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.observeParentLocked()
+	return s.decideLocked(terminal, cause)
+}
+
+func (s *streamTimeoutState) observeParentLocked() {
+	if s.terminal == streamActive {
+		if cause := s.parentCause(); cause != nil {
+			s.decideLocked(streamCanceled, cause)
+		}
+	}
+}
+
+// 终态、计时器和 Cause 在同一临界区确定；写网络数据时不持锁。
+func (s *streamTimeoutState) decideLocked(terminal streamTerminal, cause error) bool {
+	if s.terminal != streamActive {
+		return false
+	}
+	s.terminal = terminal
+	for _, timer := range []timeoutTimer{s.firstTimer, s.idleTimer, s.totalTimer} {
+		if timer != nil {
+			timer.Stop()
+		}
+	}
+	if s.stopParent() {
+		close(s.parentDone)
+	}
+	// 正常完成沿用 cancel(nil) 清理 Context；由 terminal 区分完成和客户端取消。
+	s.cancel(cause)
+	return true
+}
+
+func (s *streamTimeoutState) result() (streamTerminal, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.observeParentLocked()
+	return s.terminal, context.Cause(s.ctx)
+}
+
 func (s *streamTimeoutState) Close() {
-	s.closeOnce.Do(func() {
-		if s.firstTimer != nil {
-			s.firstTimer.Stop()
-		}
-		if s.idleTimer != nil {
-			s.idleTimer.Stop()
-		}
-		if s.totalTimer != nil {
-			s.totalTimer.Stop()
-		}
-		s.cancel(nil)
-	})
+	s.decide(streamCanceled, nil)
+	// AfterFunc 停止失败表示回调已开始；必须在锁外等待其退出。
+	<-s.parentDone
 }
 
 func timeoutFromContext(ctx context.Context) *gatewayTimeout {
